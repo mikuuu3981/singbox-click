@@ -2995,6 +2995,25 @@ _list_shortcuts() {
     done
 }
 
+_shortcut_count() {
+    local shortcuts="$1"
+    [[ -n "$shortcuts" ]] || { echo 0; return 0; }
+    printf '%s\n' "$shortcuts" | sed '/^$/d' | wc -l | tr -d ' '
+}
+
+_remove_registered_shortcuts() {
+    local shortcuts="$1" keep="${2:-}" name removed=()
+    while IFS= read -r name; do
+        [[ -z "$name" || "$name" == "$keep" ]] && continue
+        if rm -f "${SELF_INSTALL_DIR}/${name}"; then
+            removed+=("$name")
+        fi
+    done <<< "$shortcuts"
+    if [[ ${#removed[@]} -gt 0 ]]; then
+        _ok "已移除旧快捷命令: ${removed[*]}"
+    fi
+}
+
 install_shortcut() {
     _header "安装快捷命令"
 
@@ -3013,6 +3032,8 @@ install_shortcut() {
     fi
 
     local link="${SELF_INSTALL_DIR}/${name}"
+    local old_shortcuts
+    old_shortcuts="$(_list_shortcuts)"
 
     # 若同名命令已存在且不是本脚本的软链接, 提醒避免覆盖系统命令
     if [[ -e "$link" && ! -L "$link" ]]; then
@@ -3033,6 +3054,7 @@ install_shortcut() {
     fi
     chmod 755 "$SELF_INSTALL_PATH"
 
+    _remove_registered_shortcuts "$old_shortcuts" "$name"
     ln -sf "$SELF_INSTALL_PATH" "$link"
 
     _ok "已安装快捷命令: ${G}${name}${NC}"
@@ -3105,10 +3127,14 @@ uninstall_script() {
 shortcut_menu() {
     while true; do
         _header "快捷命令 / 卸载"
-        local shortcuts
+        local shortcuts shortcut_count
         shortcuts="$(_list_shortcuts)"
+        shortcut_count="$(_shortcut_count "$shortcuts")"
         if [[ -n "$shortcuts" ]]; then
             echo -e "  已注册命令: ${G}$(echo "$shortcuts" | tr '\n' ' ')${NC}"
+            if [[ "$shortcut_count" -gt 1 ]]; then
+                _warn "检测到多个旧快捷命令, 安装新命令后只会保留一个。"
+            fi
         else
             echo -e "  已注册命令: ${Y}无${NC}"
         fi
@@ -3133,27 +3159,33 @@ main_menu() {
         _header "${APP_NAME} v${SCRIPT_VERSION}"
 
         # 概览
+        local has_core=0
         if core_installed; then
+            has_core=1
             echo -e "  内核: ${G}$(core_version)${NC}"
         else
             echo -e "  内核: ${Y}未安装${NC}"
         fi
-        local pc="0"
-        [[ -f "$CONFIG_FILE" ]] && pc="$(jq -r '.inbounds|length' "$CONFIG_FILE" 2>/dev/null)"
-        echo -e "  协议: ${W}${pc}${NC} 个   系统: ${W}${DISTRO_ID:-linux}${NC} / ${W}${PKG_MGR:-?}${NC}"
+        if [[ "$has_core" == "1" ]]; then
+            local pc="0"
+            [[ -f "$CONFIG_FILE" ]] && pc="$(jq -r '.inbounds|length' "$CONFIG_FILE" 2>/dev/null)"
+            echo -e "  协议: ${W}${pc}${NC} 个   系统: ${W}${DISTRO_ID:-linux}${NC} / ${W}${PKG_MGR:-?}${NC}"
+        else
+            echo -e "  状态: ${Y}请先安装内核${NC}   系统: ${W}${DISTRO_ID:-linux}${NC} / ${W}${PKG_MGR:-?}${NC}"
+        fi
         echo ""
 
         local opts=() actions=()
         opts+=("内核管理")
         actions+=("core")
-        if core_installed; then
+        if [[ "$has_core" == "1" ]]; then
             opts+=("协议管理")
             actions+=("protocol")
+            opts+=("出口 / 规则")
+            actions+=("outbound")
+            opts+=("服务管理")
+            actions+=("service")
         fi
-        opts+=("出口 / 规则")
-        actions+=("outbound")
-        opts+=("服务管理")
-        actions+=("service")
         opts+=("更新脚本")
         actions+=("update")
         opts+=("快捷命令")
