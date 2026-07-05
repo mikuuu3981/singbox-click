@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2016
 #═══════════════════════════════════════════════════════════════════════════════
 #  singbox-click 管理脚本
 #
@@ -24,7 +25,8 @@ readonly GITHUB_REPO="mikuuu3981/singbox-click"
 readonly GITHUB_API_REPO="https://api.github.com/repos/${GITHUB_REPO}"
 readonly GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO}"
 readonly CONFIG_DIR="/etc/singbox-click"
-readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
+readonly CONFIG_FILE="${CONFIG_DIR}/${APP_NAME}.json"
+readonly LEGACY_CONFIG_FILE="${CONFIG_DIR}/config.json"
 readonly CERT_DIR="${CONFIG_DIR}/certs"
 readonly NODES_FILE="${CONFIG_DIR}/nodes.json"
 readonly CHAIN_DOMAIN_STRATEGY_FILE="${CONFIG_DIR}/chain-domain-strategy"
@@ -34,7 +36,7 @@ readonly SINGBOX_CONFIG_FILE="${SINGBOX_DIR}/config.json"
 readonly SERVICE="sing-box"
 
 # 运行态文件:
-#   /etc/singbox-click/config.json              singbox-click 管理的运行配置
+#   /etc/singbox-click/singbox-click.json      singbox-click 管理的运行配置
 #   /etc/sing-box/config.json                   指向上述配置的兼容链接, 供官方服务读取
 #   nodes.json               链式代理节点库, 与运行配置解耦
 #   chain-domain-strategy    chain-* 出站访问域名时的解析策略
@@ -55,11 +57,10 @@ readonly SAGERNET_SOURCE="/etc/apt/sources.list.d/sagernet.sources"
 #  颜色与输出助手
 #───────────────────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
-    R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'
-    C=$'\e[36m'; M=$'\e[35m'; W=$'\e[97m'; D=$'\e[2m'
-    BOLD=$'\e[1m'; INV=$'\e[7m'; NC=$'\e[0m'
+    R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'
+    W=$'\e[97m'; D=$'\e[2m'; BOLD=$'\e[1m'; NC=$'\e[0m'
 else
-    R=''; G=''; Y=''; B=''; C=''; M=''; W=''; D=''; BOLD=''; INV=''; NC=''
+    R=''; G=''; Y=''; C=''; W=''; D=''; BOLD=''; NC=''
 fi
 
 _line()  { echo -e "  ${D}────────────────────────────────────────────────────────${NC}"; }
@@ -646,10 +647,32 @@ secure_config_permissions() {
 migrate_legacy_config_dir() {
     [[ "$CONFIG_DIR" == "$SINGBOX_DIR" ]] && return 0
     mkdir -p "$CONFIG_DIR" "$CERT_DIR"
+
+    local name legacy target backup
+    if [[ "$LEGACY_CONFIG_FILE" != "$CONFIG_FILE" && ! -L "$LEGACY_CONFIG_FILE" && -f "$LEGACY_CONFIG_FILE" ]]; then
+        if [[ ! -f "$CONFIG_FILE" ]]; then
+            mv "$LEGACY_CONFIG_FILE" "$CONFIG_FILE"
+        else
+            backup="${LEGACY_CONFIG_FILE}.singbox-click.bak.$(date +%Y%m%d%H%M%S)"
+            mv "$LEGACY_CONFIG_FILE" "$backup"
+        fi
+    elif [[ "$LEGACY_CONFIG_FILE" != "$CONFIG_FILE" && -L "$LEGACY_CONFIG_FILE" ]]; then
+        local current
+        current="$(readlink -f "$LEGACY_CONFIG_FILE" 2>/dev/null || true)"
+        if [[ "$current" == "$CONFIG_FILE" ]]; then
+            rm -f "$LEGACY_CONFIG_FILE"
+        else
+            if [[ -n "$current" && -f "$current" && ! -f "$CONFIG_FILE" ]]; then
+                cp -p "$current" "$CONFIG_FILE" 2>/dev/null || cp "$current" "$CONFIG_FILE" 2>/dev/null || true
+            fi
+            backup="${LEGACY_CONFIG_FILE}.singbox-click.bak.$(date +%Y%m%d%H%M%S)"
+            mv "$LEGACY_CONFIG_FILE" "$backup"
+        fi
+    fi
+
     [[ -d "$SINGBOX_DIR" ]] || return 0
 
-    local name legacy target
-    for name in config.json nodes.json chain-domain-strategy; do
+    for name in nodes.json chain-domain-strategy; do
         legacy="${SINGBOX_DIR}/${name}"
         target="${CONFIG_DIR}/${name}"
         if [[ -L "$legacy" ]]; then
@@ -661,6 +684,14 @@ migrate_legacy_config_dir() {
             mv "$legacy" "${legacy}.singbox-click.bak.$(date +%Y%m%d%H%M%S)"
         fi
     done
+
+    legacy="$SINGBOX_CONFIG_FILE"
+    target="$CONFIG_FILE"
+    if [[ ! -L "$legacy" && -f "$legacy" && ! -f "$target" ]]; then
+        if _legacy_singbox_config_has_user_state "$legacy"; then
+            mv "$legacy" "$target"
+        fi
+    fi
 
     if [[ -d "${SINGBOX_DIR}/certs" ]]; then
         local cert
@@ -674,7 +705,33 @@ migrate_legacy_config_dir() {
     fi
 }
 
+_legacy_singbox_config_has_user_state() {
+    local file="$1"
+    jq -e '
+        ((.inbounds // []) | length > 0) or
+        ([.outbounds[]? | select(((.tag // "") | startswith("chain-")) or ((.type // "") != "direct" and (.type // "") != "block"))] | length > 0) or
+        ((.route.rule_set // []) | length > 0)
+    ' "$file" >/dev/null 2>&1
+}
+
+_write_base_config() {
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<'EOF'
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ]
+}
+EOF
+}
+
 ensure_singbox_config_link() {
+    [[ -f "$CONFIG_FILE" ]] || _write_base_config
     mkdir -p "$SINGBOX_DIR"
     if [[ -L "$SINGBOX_CONFIG_FILE" ]]; then
         local current
@@ -682,11 +739,10 @@ ensure_singbox_config_link() {
         [[ "$current" == "$CONFIG_FILE" ]] && return 0
         rm -f "$SINGBOX_CONFIG_FILE"
     elif [[ -e "$SINGBOX_CONFIG_FILE" ]]; then
-        if [[ ! -f "$CONFIG_FILE" ]]; then
-            mv "$SINGBOX_CONFIG_FILE" "$CONFIG_FILE"
-        else
-            mv "$SINGBOX_CONFIG_FILE" "${SINGBOX_CONFIG_FILE}.singbox-click.bak.$(date +%Y%m%d%H%M%S)"
-        fi
+        local backup
+        backup="${SINGBOX_CONFIG_FILE}.singbox-click.bak.$(date +%Y%m%d%H%M%S)"
+        mv "$SINGBOX_CONFIG_FILE" "$backup" || return 1
+        _dim "原 ${SINGBOX_CONFIG_FILE} 已备份: ${backup}"
     fi
     ln -s "$CONFIG_FILE" "$SINGBOX_CONFIG_FILE"
 }
@@ -724,7 +780,7 @@ _migrate_legacy_chain_domain_strategy_options() {
     use_resolver=0
     _chain_domain_resolver_supported && use_resolver=1
 
-    tmp="$(mktemp "${CONFIG_DIR}/.config.json.XXXXXX")" || return 1
+    tmp="$(mktemp "${CONFIG_DIR}/.singbox-click.json.XXXXXX")" || return 1
     if jq --arg resolver "$CHAIN_DOMAIN_RESOLVER_TAG" \
         --arg use_resolver "$use_resolver" \
         --argjson managed_tags "$managed_tags" '
@@ -780,26 +836,63 @@ _migrate_legacy_chain_domain_strategy_options() {
     return 1
 }
 
+_migrate_packaged_default_fragments() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+
+    local need_cleanup tmp
+    need_cleanup="$(jq -r '
+        def packaged_hijack_dns:
+            (type == "object") and
+            ((.action // "") == "hijack-dns") and
+            ((.port // null) == 53) and
+            ((keys_unsorted - ["port","action"]) | length == 0);
+
+        (([.outbounds[]? | select((.type // "") == "direct" and ((.tag // "") == ""))] | length) +
+         ([.route.rules[]? | select(packaged_hijack_dns)] | length)) > 0
+    ' "$CONFIG_FILE" 2>/dev/null)" || return 0
+    [[ "$need_cleanup" == "true" ]] || return 0
+
+    tmp="$(mktemp "${CONFIG_DIR}/.singbox-click.json.XXXXXX")" || return 1
+    if jq '
+        def packaged_hijack_dns:
+            (type == "object") and
+            ((.action // "") == "hijack-dns") and
+            ((.port // null) == 53) and
+            ((keys_unsorted - ["port","action"]) | length == 0);
+        def untagged_direct:
+            (type == "object") and
+            ((.type // "") == "direct") and
+            ((.tag // "") == "");
+
+        .outbounds = ((.outbounds // []) | map(select(untagged_direct | not))) |
+        (if ([.outbounds[]?.tag] | index("direct")) then . else .outbounds = ([{"type":"direct","tag":"direct"}] + (.outbounds // [])) end) |
+        (if ((.route.rules? // null) | type) == "array" then
+            .route.rules = ((.route.rules // []) | map(select(packaged_hijack_dns | not)))
+        else
+            .
+        end)
+    ' "$CONFIG_FILE" >"$tmp" 2>/dev/null; then
+        if config_check_file "$tmp" >/dev/null; then
+            mv "$tmp" "$CONFIG_FILE"
+            secure_config_permissions
+            return 0
+        fi
+    fi
+
+    rm -f "$tmp"
+    return 1
+}
+
 ensure_config() {
     migrate_legacy_config_dir
     mkdir -p "$CONFIG_DIR" "$CERT_DIR"
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        cat > "$CONFIG_FILE" <<'EOF'
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [],
-  "outbounds": [
-    { "type": "direct", "tag": "direct" }
-  ]
-}
-EOF
+        _write_base_config
     fi
+    _migrate_packaged_default_fragments || _warn "官方默认配置片段清理失败, 请手动检查 ${CONFIG_FILE}"
     _migrate_legacy_chain_domain_strategy_options || _warn "旧版链式代理解析配置迁移失败, 请手动检查 ${CONFIG_FILE}"
     if core_installed; then
-        ensure_singbox_config_link
+        ensure_singbox_config_link || _warn "创建 ${SINGBOX_CONFIG_FILE} 兼容链接失败"
     fi
     secure_config_permissions
 }
@@ -821,7 +914,7 @@ config_apply_checked() {
     CONFIG_TRANSITION_ERROR=""
 
     local tmp errf check_out
-    tmp="$(mktemp "${CONFIG_DIR}/.config.json.XXXXXX")" || return 1
+    tmp="$(mktemp "${CONFIG_DIR}/.singbox-click.json.XXXXXX")" || return 1
     errf="$(mktemp)" || { rm -f "$tmp"; return 1; }
 
     if ! jq "$@" "$CONFIG_FILE" >"$tmp" 2>"$errf"; then
@@ -848,7 +941,11 @@ config_apply_checked() {
 }
 
 _print_config_transition_error() {
-    [[ -n "$CONFIG_TRANSITION_ERROR" ]] && echo "$CONFIG_TRANSITION_ERROR" | sed 's/^/    /'
+    local line
+    [[ -n "$CONFIG_TRANSITION_ERROR" ]] || return 0
+    while IFS= read -r line; do
+        echo "    $line"
+    done <<< "$CONFIG_TRANSITION_ERROR"
 }
 
 # 校验配置 (需内核已安装)
@@ -1528,9 +1625,33 @@ service_menu() {
             "查看实时日志" \
             "返回主菜单"
         case "$MENU_CHOICE" in
-            1) ensure_config; systemctl enable "$SERVICE" >/dev/null 2>&1; systemctl start "$SERVICE" && _ok "已启动" || _err "启动失败"; _pause ;;
-            2) systemctl stop "$SERVICE" && _ok "已停止" || _err "停止失败"; _pause ;;
-            3) ensure_config; systemctl restart "$SERVICE" && _ok "已重启" || _err "重启失败"; _pause ;;
+            1)
+                ensure_config
+                systemctl enable "$SERVICE" >/dev/null 2>&1
+                if systemctl start "$SERVICE"; then
+                    _ok "已启动"
+                else
+                    _err "启动失败"
+                fi
+                _pause
+                ;;
+            2)
+                if systemctl stop "$SERVICE"; then
+                    _ok "已停止"
+                else
+                    _err "停止失败"
+                fi
+                _pause
+                ;;
+            3)
+                ensure_config
+                if systemctl restart "$SERVICE"; then
+                    _ok "已重启"
+                else
+                    _err "重启失败"
+                fi
+                _pause
+                ;;
             4) echo ""; systemctl status "$SERVICE" --no-pager -l 2>&1 | head -20; _pause ;;
             5) echo ""; _dim "Ctrl+C 退出日志"; echo ""; journalctl -u "$SERVICE" -f --no-pager ;;
             *) return ;;
@@ -1766,7 +1887,7 @@ parse_proxy_url() {
     local scheme rest frag query name ob
 
     scheme="${url%%://*}"
-    scheme="$(echo "$scheme" | tr 'A-Z' 'a-z')"
+    scheme="$(echo "$scheme" | tr '[:upper:]' '[:lower:]')"
     rest="${url#*://}"
     [[ "$url" == "$scheme" || -z "$rest" ]] && { echo "链接格式错误 (缺少 ://)" >&2; return 1; }
 
@@ -1859,7 +1980,7 @@ _list_outbound_tags() {
 }
 
 #───────────────────────────────────────────────────────────────────────────────
-#  节点库 (nodes.json): 保存导入的链式代理节点, 与 config.json 解耦
+#  节点库 (nodes.json): 保存导入的链式代理节点, 与运行配置解耦
 #───────────────────────────────────────────────────────────────────────────────
 ensure_nodes() {
     mkdir -p "$CONFIG_DIR"
@@ -1884,7 +2005,7 @@ _nodes_count() {
     jq -r '.nodes|length' "$NODES_FILE" 2>/dev/null
 }
 
-# 节点是否处于启用状态: active_tag 对应的 outbound 是否仍在 config.json 中。
+# 节点是否处于启用状态: active_tag 对应的 outbound 是否仍在运行配置中。
 _node_active_tag_live() {
     local tag="$1"
     [[ -z "$tag" || "$tag" == "null" ]] && return 1
@@ -1941,7 +2062,7 @@ _node_supported() {
     [[ -n "$ob" && "$ob" != "null" ]] && _chain_outbound_supported "$ob"
 }
 
-# 启用节点: 把节点库里的 outbound 写入 config.json, 并记录 active_tag。
+# 启用节点: 把节点库里的 outbound 写入运行配置, 并记录 active_tag。
 _activate_node() {
     local id="$1"
     local name ob type server active_tag
@@ -2000,7 +2121,7 @@ _activate_node() {
     return 0
 }
 
-# 停用节点: 从 config.json 移除其出口, 并清理相关规则。
+# 停用节点: 从运行配置移除其出口, 并清理相关规则。
 _deactivate_node() {
     local id="$1"
     local tag; tag="$(_node_get "$id" active_tag)"
@@ -2331,7 +2452,11 @@ _restart_if_running() {
     if core_installed && systemctl is-active --quiet "$SERVICE"; then
         ensure_singbox_config_link
         secure_config_permissions
-        systemctl restart "$SERVICE" 2>/dev/null && _ok "服务已重启生效" || _err "服务重启失败, 请查看日志"
+        if systemctl restart "$SERVICE" 2>/dev/null; then
+            _ok "服务已重启生效"
+        else
+            _err "服务重启失败, 请查看日志"
+        fi
     fi
 }
 

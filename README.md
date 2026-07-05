@@ -53,7 +53,7 @@ singbox-click
 主要文件:
 
 ```text
-/etc/singbox-click/config.json              sing-box 运行配置
+/etc/singbox-click/singbox-click.json      sing-box 运行配置
 /etc/singbox-click/nodes.json               链式代理节点库
 /etc/singbox-click/chain-domain-strategy    链式代理域名解析策略
 /etc/singbox-click/certs/                   脚本生成的证书
@@ -62,10 +62,10 @@ singbox-click
 安装内核后，脚本会创建兼容链接:
 
 ```text
-/etc/sing-box/config.json -> /etc/singbox-click/config.json
+/etc/sing-box/config.json -> /etc/singbox-click/singbox-click.json
 ```
 
-这样官方 `sing-box` 服务仍然可以按默认路径读取配置，同时项目自己的数据不直接混在 `/etc/sing-box` 里。
+这样官方 `sing-box` 服务仍然可以按默认路径读取配置，同时项目自己的数据不直接混在 `/etc/sing-box` 里。若安装包已经自带了 `/etc/sing-box/config.json`，脚本会先备份它，再链接到自己的干净配置；不会把官方默认配置当作初始模板继续写。旧版本的 `/etc/singbox-click/config.json` 会自动迁移为 `/etc/singbox-click/singbox-click.json`。
 
 ## 协议说明
 
@@ -103,7 +103,7 @@ SS2022 仍然使用标准 `ss://` 分享链接，通过 `2022-*` 加密方式区
 
 ```text
 导入节点 -> 写入 /etc/singbox-click/nodes.json
-启用节点 -> 写入 config.json 的出口
+启用节点 -> 写入 singbox-click.json 的出口
 设置流量规则 -> 按规则选择出口；没有命中规则时走默认出口
 ```
 
@@ -111,7 +111,9 @@ SS2022 仍然使用标准 `ss://` 分享链接，通过 `2022-*` 加密方式区
 
 链式代理节点服务器地址为域名时，脚本会按当前解析策略写入 `domain_resolver`，并自动创建本地 DNS 解析器 `singbox-click-local`。旧配置里的 `domain_strategy` 会在脚本启动时自动迁移，避免触发 `sing-box >= 1.12.0` 的弃用检查。
 
-涉及 `config.json` 的变更会先写入临时配置并执行校验；校验通过后才替换正式配置，避免出现“校验失败但已写入半成品配置”的状态。
+服务器入站代理场景默认不启用 DNS 接管。若旧配置里带有官方默认的 `53/hijack-dns` 片段，脚本启动时会自动清理。
+
+涉及 `singbox-click.json` 的变更会先写入临时配置并执行校验；校验通过后才替换正式配置，避免出现“校验失败但已写入半成品配置”的状态。
 
 ## 安全
 
