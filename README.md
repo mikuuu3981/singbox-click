@@ -15,7 +15,8 @@
 - 配置禁止回国流量、广告拦截、自定义规则文件和默认出口
 - 查看、启动、停止、重启 `sing-box` systemd 服务
 - 安装本脚本的快捷命令
-- 从 GitHub 检测并更新脚本
+- 完全卸载脚本、`sing-box` 内核和 `/etc/singbox-click` 配置
+- 从 GitHub 检测并更新脚本，同时同步已安装的快捷命令副本
 
 ## 环境要求
 
@@ -65,7 +66,7 @@ singbox-click
 /etc/sing-box/config.json -> /etc/singbox-click/singbox-click.json
 ```
 
-这样官方 `sing-box` 服务仍然可以按默认路径读取配置，同时项目自己的数据不直接混在 `/etc/sing-box` 里。若安装包已经自带了 `/etc/sing-box/config.json`，脚本会先备份它，再链接到自己的干净配置；不会把官方默认配置当作初始模板继续写。旧版本的 `/etc/singbox-click/config.json` 会自动迁移为 `/etc/singbox-click/singbox-click.json`。
+这样官方 `sing-box` 服务仍然可以按默认路径读取配置，同时项目自己的数据不直接混在 `/etc/sing-box` 里。若安装包已经自带了 `/etc/sing-box/config.json`，脚本会移除官方默认配置并链接到自己的干净配置；不会把官方默认配置当作初始模板继续写。旧版本的 `/etc/singbox-click/config.json` 会自动迁移为 `/etc/singbox-click/singbox-click.json`。
 
 ## 协议说明
 
@@ -128,6 +129,6 @@ SS2022 仍然使用标准 `ss://` 分享链接，通过 `2022-*` 加密方式区
 ## 注意
 
 - 本项目面向服务器环境，不适合在本地桌面系统运行
-- 删除内核时可以选择是否同时删除 `/etc/singbox-click`
+- 完全卸载会删除 `sing-box` 内核、服务、快捷命令和 `/etc/singbox-click`
 - 规则文件远程 URL 检测会访问网络
 - 自定义规则和链式代理变更后，如果服务正在运行，脚本会尝试重启服务生效

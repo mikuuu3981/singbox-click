@@ -502,31 +502,39 @@ core_update() {
     return 0
 }
 
-core_remove() {
-    _header "内核删除"
+_singbox_core_present() {
+    core_installed || dpkg -s sing-box >/dev/null 2>&1 || dpkg -s sing-box-beta >/dev/null 2>&1
+}
 
-    if ! core_installed && ! dpkg -s sing-box >/dev/null 2>&1 && ! dpkg -s sing-box-beta >/dev/null 2>&1; then
-        _warn "未检测到已安装的 sing-box。"
-        _pause
-        return 1
+_remove_click_config_dir() {
+    if [[ -L "$SINGBOX_CONFIG_FILE" ]]; then
+        local target
+        target="$(readlink -f "$SINGBOX_CONFIG_FILE" 2>/dev/null || true)"
+        if [[ "$target" == "$CONFIG_FILE" || "$target" == "$LEGACY_CONFIG_FILE" || "$target" == "$CONFIG_DIR"/* ]]; then
+            rm -f "$SINGBOX_CONFIG_FILE"
+            _ok "已删除兼容链接 ${SINGBOX_CONFIG_FILE}"
+        fi
     fi
 
-    _warn "这将卸载 sing-box 内核。"
-    read -rp "  是否同时删除配置文件 ${CONFIG_DIR} ? [y/N]: " del_cfg
-    echo ""
-    read -rp "  确认卸载内核? 输入 ${R}yes${NC} 继续: " confirm
-    if [[ "$confirm" != "yes" ]]; then
-        _warn "已取消"
-        _pause
-        return 1
+    if [[ -d "$CONFIG_DIR" ]]; then
+        rm -rf "$CONFIG_DIR"
+        _ok "已删除配置目录 ${CONFIG_DIR}"
+    else
+        _dim "配置目录不存在: ${CONFIG_DIR}"
     fi
+}
+
+_remove_singbox_core() {
+    local delete_config="${1:-no}"
+    local had_core=0
+    _singbox_core_present && had_core=1
 
     systemctl stop "$SERVICE" 2>/dev/null || true
     systemctl disable "$SERVICE" 2>/dev/null || true
 
     if [[ "$PKG_MGR" == "apt" ]]; then
-        apt-get remove -y sing-box sing-box-beta >/dev/null 2>&1
-        apt-get purge -y sing-box sing-box-beta >/dev/null 2>&1
+        apt-get remove -y sing-box sing-box-beta >/dev/null 2>&1 || true
+        apt-get purge -y sing-box sing-box-beta >/dev/null 2>&1 || true
     fi
 
     # 兜底: apt 卸载后若命令仍存在, 说明是手动安装的二进制 (非 apt 包管理)
@@ -537,7 +545,6 @@ core_remove() {
         if [[ -n "$bin_path" ]] && ! dpkg -S "$bin_path" >/dev/null 2>&1; then
             _warn "检测到手动安装的 sing-box: ${bin_path}"
             rm -f "$bin_path" && _ok "已删除二进制 ${bin_path}"
-            # 清理手动创建的 systemd 单元
             local unit removed_unit=0
             for unit in /etc/systemd/system/sing-box.service \
                         /etc/systemd/system/sing-box@.service \
@@ -553,20 +560,44 @@ core_remove() {
         fi
     fi
 
-    if [[ "$del_cfg" =~ ^[Yy]$ ]]; then
-        if [[ -L "$SINGBOX_CONFIG_FILE" ]] && [[ "$(readlink -f "$SINGBOX_CONFIG_FILE" 2>/dev/null)" == "$CONFIG_FILE" ]]; then
-            rm -f "$SINGBOX_CONFIG_FILE"
-        fi
-        rm -rf "$CONFIG_DIR"
-        _ok "已删除配置目录 ${CONFIG_DIR}"
+    if [[ "$delete_config" =~ ^[Yy]$ ]]; then
+        _remove_click_config_dir
     fi
 
     if core_installed; then
         _err "卸载后仍检测到 sing-box 命令: $(command -v sing-box)"
         _warn "该副本可能位于非常规目录, 请手动删除。"
-    else
-        _ok "sing-box 内核已卸载"
+        return 1
     fi
+
+    if [[ "$had_core" == "1" ]]; then
+        _ok "sing-box 内核已卸载"
+    else
+        _dim "sing-box 内核未安装, 已跳过"
+    fi
+    return 0
+}
+
+core_remove() {
+    _header "内核删除"
+
+    if ! _singbox_core_present; then
+        _warn "未检测到已安装的 sing-box。"
+        _pause
+        return 1
+    fi
+
+    _warn "这将卸载 sing-box 内核。"
+    read -rp "  是否同时删除配置文件 ${CONFIG_DIR} ? [y/N]: " del_cfg
+    echo ""
+    read -rp "  确认卸载内核? 输入 ${R}yes${NC} 继续: " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        _warn "已取消"
+        _pause
+        return 1
+    fi
+
+    _remove_singbox_core "$del_cfg"
 
     _pause
     return 0
@@ -648,13 +679,12 @@ migrate_legacy_config_dir() {
     [[ "$CONFIG_DIR" == "$SINGBOX_DIR" ]] && return 0
     mkdir -p "$CONFIG_DIR" "$CERT_DIR"
 
-    local name legacy target backup
+    local name legacy target
     if [[ "$LEGACY_CONFIG_FILE" != "$CONFIG_FILE" && ! -L "$LEGACY_CONFIG_FILE" && -f "$LEGACY_CONFIG_FILE" ]]; then
         if [[ ! -f "$CONFIG_FILE" ]]; then
             mv "$LEGACY_CONFIG_FILE" "$CONFIG_FILE"
         else
-            backup="${LEGACY_CONFIG_FILE}.singbox-click.bak.$(date +%Y%m%d%H%M%S)"
-            mv "$LEGACY_CONFIG_FILE" "$backup"
+            rm -f "$LEGACY_CONFIG_FILE"
         fi
     elif [[ "$LEGACY_CONFIG_FILE" != "$CONFIG_FILE" && -L "$LEGACY_CONFIG_FILE" ]]; then
         local current
@@ -665,8 +695,7 @@ migrate_legacy_config_dir() {
             if [[ -n "$current" && -f "$current" && ! -f "$CONFIG_FILE" ]]; then
                 cp -p "$current" "$CONFIG_FILE" 2>/dev/null || cp "$current" "$CONFIG_FILE" 2>/dev/null || true
             fi
-            backup="${LEGACY_CONFIG_FILE}.singbox-click.bak.$(date +%Y%m%d%H%M%S)"
-            mv "$LEGACY_CONFIG_FILE" "$backup"
+            rm -f "$LEGACY_CONFIG_FILE"
         fi
     fi
 
@@ -681,7 +710,7 @@ migrate_legacy_config_dir() {
         if [[ -f "$legacy" && ! -f "$target" ]]; then
             mv "$legacy" "$target"
         elif [[ -f "$legacy" && -f "$target" && "$legacy" != "$SINGBOX_CONFIG_FILE" ]]; then
-            mv "$legacy" "${legacy}.singbox-click.bak.$(date +%Y%m%d%H%M%S)"
+            rm -f "$legacy"
         fi
     done
 
@@ -739,10 +768,8 @@ ensure_singbox_config_link() {
         [[ "$current" == "$CONFIG_FILE" ]] && return 0
         rm -f "$SINGBOX_CONFIG_FILE"
     elif [[ -e "$SINGBOX_CONFIG_FILE" ]]; then
-        local backup
-        backup="${SINGBOX_CONFIG_FILE}.singbox-click.bak.$(date +%Y%m%d%H%M%S)"
-        mv "$SINGBOX_CONFIG_FILE" "$backup" || return 1
-        _dim "原 ${SINGBOX_CONFIG_FILE} 已备份: ${backup}"
+        rm -f "$SINGBOX_CONFIG_FILE" || return 1
+        _dim "已移除原 ${SINGBOX_CONFIG_FILE}"
     fi
     ln -s "$CONFIG_FILE" "$SINGBOX_CONFIG_FILE"
 }
@@ -2861,7 +2888,9 @@ update_script() {
         return 1
     fi
 
-    local branch="main" meta tmp url remote_version backup
+    local branch="main" meta tmp url remote_version
+    local script_real self_real
+    local source_needs_update=0 shortcut_needs_sync=0 shortcuts=""
     _info "检查 GitHub 最新脚本..."
     if meta="$(curl -fsSL --connect-timeout 10 --max-time 15 "$GITHUB_API_REPO" 2>/dev/null)"; then
         branch="$(echo "$meta" | jq -r '.default_branch // empty' 2>/dev/null)"
@@ -2884,7 +2913,17 @@ update_script() {
         return 1
     fi
 
-    if cmp -s "$SCRIPT_SRC" "$tmp"; then
+    shortcuts="$(_list_shortcuts)"
+    if ! cmp -s "$SCRIPT_SRC" "$tmp"; then
+        source_needs_update=1
+    fi
+    script_real="$(readlink -f "$SCRIPT_SRC" 2>/dev/null || true)"
+    self_real="$(readlink -f "$SELF_INSTALL_PATH" 2>/dev/null || true)"
+    if [[ -f "$SELF_INSTALL_PATH" && "$self_real" != "$script_real" ]] && ! cmp -s "$SELF_INSTALL_PATH" "$tmp"; then
+        shortcut_needs_sync=1
+    fi
+
+    if [[ "$source_needs_update" == "0" && "$shortcut_needs_sync" == "0" ]]; then
         rm -f "$tmp"
         _ok "当前已是最新脚本。"
         _pause
@@ -2896,8 +2935,12 @@ update_script() {
     echo -e "  当前版本: ${W}${SCRIPT_VERSION}${NC}"
     echo -e "  最新版本: ${W}${remote_version}${NC}"
     echo -e "  来源分支: ${W}${branch}${NC}"
+    if [[ "$shortcut_needs_sync" == "1" ]]; then
+        echo -e "  快捷命令: ${W}需要同步${NC}"
+        [[ -n "$shortcuts" ]] && echo -e "  已注册命令: ${W}$(echo "$shortcuts" | tr '\n' ' ')${NC}"
+    fi
     echo ""
-    read -rp "  是否更新当前脚本? [y/N]: " ok
+    read -rp "  是否执行更新? [y/N]: " ok
     if [[ ! "$ok" =~ ^[Yy]$ ]]; then
         rm -f "$tmp"
         _warn "已取消"
@@ -2905,25 +2948,32 @@ update_script() {
         return 1
     fi
 
-    backup="${SCRIPT_SRC}.bak.$(date +%Y%m%d%H%M%S)"
-    if ! cp -p "$SCRIPT_SRC" "$backup"; then
-        rm -f "$tmp"
-        _err "创建备份失败, 已中止。"
-        _pause
-        return 1
+    if [[ "$source_needs_update" == "1" ]]; then
+        if ! cp -f "$tmp" "$SCRIPT_SRC"; then
+            rm -f "$tmp"
+            _err "替换脚本失败。"
+            _pause
+            return 1
+        fi
+        chmod 755 "$SCRIPT_SRC" 2>/dev/null || true
     fi
 
-    if ! cp -f "$tmp" "$SCRIPT_SRC"; then
-        rm -f "$tmp"
-        _err "替换脚本失败, 备份保留在: ${backup}"
-        _pause
-        return 1
+    if [[ "$shortcut_needs_sync" == "1" ]]; then
+        if ! cp -f "$tmp" "$SELF_INSTALL_PATH"; then
+            rm -f "$tmp"
+            _err "同步快捷命令副本失败。"
+            _pause
+            return 1
+        fi
+        chmod 755 "$SELF_INSTALL_PATH" 2>/dev/null || true
     fi
-    chmod 755 "$SCRIPT_SRC" 2>/dev/null || true
+
     rm -f "$tmp"
 
     _ok "脚本已更新。"
-    _dim "备份: ${backup}"
+    if [[ "$shortcut_needs_sync" == "1" && -n "$shortcuts" ]]; then
+        _ok "已同步快捷命令: $(echo "$shortcuts" | tr '\n' ' ')"
+    fi
     _dim "请重新运行脚本以加载新版本。"
     _pause
     exit 0
@@ -2993,25 +3043,39 @@ install_shortcut() {
 }
 
 uninstall_script() {
-    _header "卸载脚本 / 清除快捷命令"
+    _header "完全卸载"
 
-    local shortcuts
+    local shortcuts self_copy_present=0
     shortcuts="$(_list_shortcuts)"
 
     echo -e "  将执行以下清理:"
+    if _singbox_core_present; then
+        echo -e "    · 卸载 sing-box 内核并停止服务"
+    else
+        echo -e "    · ${D}未检测到 sing-box 内核${NC}"
+    fi
+    echo -e "    · 删除配置目录: ${W}${CONFIG_DIR}${NC}"
+    if [[ -L "$SINGBOX_CONFIG_FILE" ]]; then
+        echo -e "    · 删除兼容链接: ${W}${SINGBOX_CONFIG_FILE}${NC}"
+    fi
     if [[ -n "$shortcuts" ]]; then
         echo -e "    · 删除快捷命令: ${W}$(echo "$shortcuts" | tr '\n' ' ')${NC}"
     else
         echo -e "    · ${D}未发现已注册的快捷命令${NC}"
     fi
-    [[ -f "$SELF_INSTALL_PATH" ]] && echo -e "    · 删除脚本副本: ${W}${SELF_INSTALL_PATH}${NC}"
+    if [[ -f "$SELF_INSTALL_PATH" ]]; then
+        self_copy_present=1
+        echo -e "    · 删除脚本副本: ${W}${SELF_INSTALL_PATH}${NC}"
+    fi
     echo ""
-    _warn "此操作不会卸载 sing-box 内核或删除协议配置。"
-    read -rp "  确认卸载脚本? 输入 ${R}yes${NC} 继续: " confirm
+    _warn "此操作会删除内核、服务、配置、节点库、证书和快捷命令。"
+    read -rp "  确认完全卸载? 输入 ${R}yes${NC} 继续: " confirm
     if [[ "$confirm" != "yes" ]]; then
         _warn "已取消"
         _pause; return 1
     fi
+
+    _remove_singbox_core "yes" || true
 
     # 先删软链接 (此时副本仍在, readlink 可解析), 再删副本
     local removed=() name
@@ -3020,12 +3084,16 @@ uninstall_script() {
         rm -f "${SELF_INSTALL_DIR}/${name}" && removed+=("$name")
     done <<< "$shortcuts"
 
-    rm -f "$SELF_INSTALL_PATH"
+    if [[ "$self_copy_present" == "1" ]]; then
+        rm -f "$SELF_INSTALL_PATH"
+    fi
 
     if [[ ${#removed[@]} -gt 0 ]]; then
         _ok "已删除快捷命令: ${removed[*]}"
     fi
-    _ok "已删除脚本副本"
+    if [[ "$self_copy_present" == "1" && ! -f "$SELF_INSTALL_PATH" ]]; then
+        _ok "已删除脚本副本"
+    fi
     echo ""
     _dim "若你手动放置的原始脚本文件仍需删除, 请自行 rm。"
     echo ""
@@ -3047,7 +3115,7 @@ shortcut_menu() {
         echo ""
         menu_select "请选择操作" \
             "安装快捷命令 (如 sing)" \
-            "卸载脚本 (清除快捷命令)" \
+            "完全卸载 (脚本 / 内核 / 配置)" \
             "返回主菜单"
         case "$MENU_CHOICE" in
             1) install_shortcut ;;
