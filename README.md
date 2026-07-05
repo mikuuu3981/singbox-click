@@ -9,8 +9,8 @@
 - 安装、更新、删除 `sing-box` 内核
 - 安装 AnyTLS 入站
 - 安装 Shadowsocks / SS2022 入站，并选择加密方式
-- 保存 SS / SS2022 链式代理节点到节点库
-- 启用、停用、删除链式代理出口
+- 保存 SS / SS2022 链式代理节点到节点列表
+- 将链式代理节点加入 / 移出代理出口，或删除节点
 - 设置链式代理域名解析策略
 - 配置禁止回国流量、广告拦截、自定义规则文件和默认出口
 - 查看、启动、停止、重启 `sing-box` systemd 服务
@@ -55,7 +55,7 @@ singbox-click
 
 ```text
 /etc/singbox-click/singbox-click.json      sing-box 运行配置
-/etc/singbox-click/nodes.json               链式代理节点库
+/etc/singbox-click/nodes.json               链式代理节点列表
 /etc/singbox-click/chain-domain-strategy    链式代理域名解析策略
 /etc/singbox-click/certs/                   脚本生成的证书
 ```
@@ -98,13 +98,13 @@ SS2022 仍然使用标准 `ss://` 分享链接，通过 `2022-*` 加密方式区
 
 ## 链式代理
 
-链式代理节点库只保存节点，不会自动写入运行配置。
+链式代理节点先保存到节点列表；加入代理出口后才会写入运行配置，供 `sing-box` 使用。
 
 流程是:
 
 ```text
 导入节点 -> 写入 /etc/singbox-click/nodes.json
-启用节点 -> 写入 singbox-click.json 的出口
+加入代理出口 -> 写入 singbox-click.json 的出口
 设置流量规则 -> 按规则选择出口；没有命中规则时走默认出口
 ```
 
@@ -120,11 +120,11 @@ SS2022 仍然使用标准 `ss://` 分享链接，通过 `2022-*` 加密方式区
 
 脚本会尽量收紧配置权限:
 
-- 节点库和内部策略文件为 root-only
+- 节点列表和内部策略文件为 root-only
 - 配置文件和私钥只允许 root，或 `sing-box` 服务组读取
 - 自签私钥保存在 `/etc/singbox-click/certs/`
 
-不要把 `/etc/singbox-click` 下的配置、节点库或证书提交到 Git。
+不要把 `/etc/singbox-click` 下的配置、节点列表或证书提交到 Git。
 
 ## 注意
 

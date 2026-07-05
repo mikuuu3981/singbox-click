@@ -6,7 +6,7 @@
 #  功能:
 #    1. 内核管理  - 通过 SagerNet 官方 apt 源 下载 / 更新 / 删除 sing-box 内核
 #    2. 协议管理  - 安装 / 查看 / 删除代理协议 (AnyTLS / Shadowsocks, 需先安装内核)
-#    3. 链式代理  - 保存 / 启用 SS 与 SS2022 节点, 管理出口解析策略
+#    3. 链式代理  - 保存 SS 与 SS2022 节点, 加入代理出口并管理解析策略
 #    4. 流量规则  - 禁止回国流量 / 广告拦截 / 默认出口
 #    5. 服务管理  - 启动 / 停止 / 重启 / 查看 systemd 服务
 #    6. 依赖自检  - 自动检测并安装缺失的基础依赖
@@ -38,7 +38,7 @@ readonly SERVICE="sing-box"
 # 运行态文件:
 #   /etc/singbox-click/singbox-click.json      singbox-click 管理的运行配置
 #   /etc/sing-box/config.json                   指向上述配置的兼容链接, 供官方服务读取
-#   nodes.json               链式代理节点库, 与运行配置解耦
+#   nodes.json               链式代理节点列表, 与运行配置解耦
 #   chain-domain-strategy    chain-* 出站访问域名时的解析策略
 
 # 脚本自安装 / 快捷命令
@@ -1839,7 +1839,7 @@ set_chain_domain_strategy() {
         *) _warn "已取消"; _pause; return 1 ;;
     esac
 
-    # 仅同步 nodes.json 记录的已启用出口；未启用节点会在下次启用时使用新策略。
+    # 仅同步 nodes.json 记录的代理出口；未加入出口的节点会在下次加入时使用新策略。
     ensure_config
     local managed_tags use_resolver
     managed_tags="$(_chain_managed_tags_json)"
@@ -1857,7 +1857,7 @@ set_chain_domain_strategy() {
                 end
             ))
         ' || {
-            _err "同步已启用出口失败 (未写入):"
+            _err "同步代理出口失败 (未写入):"
             _print_config_transition_error
             _pause
             return 1
@@ -1883,7 +1883,7 @@ set_chain_domain_strategy() {
                     end
                 ))
             ' || {
-                _err "同步已启用出口失败 (未写入):"
+                _err "同步代理出口失败 (未写入):"
                 _print_config_transition_error
                 _pause
                 return 1
@@ -1901,7 +1901,7 @@ set_chain_domain_strategy() {
                     end
                 ))
             ' || {
-                _err "同步已启用出口失败 (未写入):"
+                _err "同步代理出口失败 (未写入):"
                 _print_config_transition_error
                 _pause
                 return 1
@@ -2016,14 +2016,8 @@ _list_chain_outbound_tags() {
     jq -r '.outbounds[]? | select(.type=="shadowsocks") | .tag' "$CONFIG_FILE" 2>/dev/null
 }
 
-# 返回可删除的代理出站 tag 列表。
-# 注意: 这里故意保留全部非 direct/block 出站, 便于清理旧版本导入的非 SS 节点。
-_list_outbound_tags() {
-    jq -r '.outbounds[]? | select(.type!="direct" and .type!="block") | .tag' "$CONFIG_FILE" 2>/dev/null
-}
-
 #───────────────────────────────────────────────────────────────────────────────
-#  节点库 (nodes.json): 保存导入的链式代理节点, 与运行配置解耦
+#  节点列表 (nodes.json): 保存导入的链式代理节点, 与运行配置解耦
 #───────────────────────────────────────────────────────────────────────────────
 ensure_nodes() {
     mkdir -p "$CONFIG_DIR"
@@ -2040,7 +2034,7 @@ nodes_apply() {
     if jq "$@" "$NODES_FILE" >"$tmp" 2>/dev/null; then
         mv "$tmp" "$NODES_FILE"; secure_config_permissions; return 0
     fi
-    rm -f "$tmp"; _err "写入节点库失败。"; return 1
+    rm -f "$tmp"; _err "写入节点列表失败。"; return 1
 }
 
 _nodes_count() {
@@ -2048,7 +2042,7 @@ _nodes_count() {
     jq -r '.nodes|length' "$NODES_FILE" 2>/dev/null
 }
 
-# 节点是否处于启用状态: active_tag 对应的 outbound 是否仍在运行配置中。
+# 节点是否已加入代理出口: active_tag 对应的 outbound 是否仍在运行配置中。
 _node_active_tag_live() {
     local tag="$1"
     [[ -z "$tag" || "$tag" == "null" ]] && return 1
@@ -2064,7 +2058,7 @@ _chain_outbound_supported() {
     [[ "$type" == "shadowsocks" && -n "$method" && "$method" != "null" ]]
 }
 
-# 解析 SS/SS2022 URL 并存入节点库; 成功回显节点 id。
+# 解析 SS/SS2022 URL 并存入节点列表; 成功回显节点 id。
 _node_add_from_url() {
     local url="$1"
     url="$(echo "$url" | tr -d '[:space:]')"
@@ -2098,23 +2092,23 @@ _node_add_from_url() {
 # 按 id 取节点字段。
 _node_get() { jq -r --arg id "$1" --arg f "$2" '.nodes[]|select(.id==$id)|.[$f] // ""' "$NODES_FILE" 2>/dev/null; }
 
-# 判断节点库中的节点是否仍属于当前支持范围。
+# 判断节点列表中的节点是否仍属于当前支持范围。
 _node_supported() {
     local ob
     ob="$(jq -c --arg id "$1" '.nodes[]|select(.id==$id)|.outbound' "$NODES_FILE" 2>/dev/null)"
     [[ -n "$ob" && "$ob" != "null" ]] && _chain_outbound_supported "$ob"
 }
 
-# 启用节点: 把节点库里的 outbound 写入运行配置, 并记录 active_tag。
+# 加入代理出口: 把节点列表里的 outbound 写入运行配置, 并记录 active_tag。
 _activate_node() {
     local id="$1"
     local name ob type server active_tag
     name="$(_node_get "$id" name)"
     active_tag="$(_node_get "$id" active_tag)"
 
-    # 已启用且出站仍在, 直接返回
+    # 已加入代理出口且仍在运行配置中, 直接返回
     if _node_active_tag_live "$active_tag"; then
-        _warn "节点已处于启用状态 (tag: $active_tag)"
+        _warn "节点已是代理出口 (tag: $active_tag)"
         return 0
     fi
 
@@ -2145,13 +2139,13 @@ _activate_node() {
         end |
         .outbounds += [$ob]
     '; then
-        _err "启用后配置校验失败 (未写入):"
+        _err "加入代理出口后配置校验失败 (未写入):"
         _print_config_transition_error
         return 1
     fi
 
     if ! nodes_apply --arg id "$id" --arg t "$tag" '(.nodes[]|select(.id==$id)|.active_tag)=$t'; then
-        _err "记录节点启用状态失败, 正在回滚出口。"
+        _err "记录代理出口状态失败, 正在回滚。"
         config_apply_checked --arg t "$tag" '
             .outbounds = ((.outbounds // []) | map(select(.tag != $t))) |
             .route.rules = ((.route.rules // []) | map(select(.outbound != $t))) |
@@ -2160,16 +2154,16 @@ _activate_node() {
         return 1
     fi
 
-    _ok "已启用节点: ${name} (出口 tag: ${tag})"
+    _ok "已加入代理出口: ${name} (tag: ${tag})"
     return 0
 }
 
-# 停用节点: 从运行配置移除其出口, 并清理相关规则。
+# 移出代理出口: 从运行配置移除其出口, 并清理相关规则。
 _deactivate_node() {
     local id="$1"
     local tag; tag="$(_node_get "$id" active_tag)"
     if ! _node_active_tag_live "$tag"; then
-        _warn "该节点当前未启用。"
+        _warn "该节点当前未加入代理出口。"
         nodes_apply --arg id "$id" '(.nodes[]|select(.id==$id)|.active_tag)=""'
         return 0
     fi
@@ -2178,9 +2172,9 @@ _deactivate_node() {
         .route.rules = ((.route.rules // []) | map(select(.outbound != $t))) |
         ( if (.route.final // "") == $t then (.route.final = "direct") else . end )
     '; then
-        _ok "已停用节点 (移除出口 $tag)"
+        _ok "已移出代理出口: $tag"
     else
-        _err "停用节点失败 (未写入):"
+        _err "移出代理出口失败 (未写入):"
         _print_config_transition_error
         return 1
     fi
@@ -2189,9 +2183,9 @@ _deactivate_node() {
     return 0
 }
 
-# 从 URL 导入节点到节点库, 支持一次粘贴多行。
+# 从 URL 导入代理节点, 支持一次粘贴多行。
 node_import() {
-    _header "导入节点到节点库"
+    _header "导入代理节点"
     ensure_nodes
     _dim "支持: ss:// 标准链接 (包含 SS2022 的 2022-* 加密方法)"
     _dim "可一次粘贴多行 (每行一个链接), 输入空行结束。"
@@ -2211,10 +2205,11 @@ node_import() {
 
     echo ""
     local u id ok=0 fail=0 errf; errf="$(mktemp)"
-    local first_id=""
+    local imported_ids=()
     for u in "${urls[@]}"; do
         if id="$(_node_add_from_url "$u" 2>"$errf")" && [[ -n "$id" ]]; then
-            ((ok++)); [[ -z "$first_id" ]] && first_id="$id"
+            ((ok++))
+            imported_ids+=("$id")
             _ok "已保存: $(_node_get "$id" name) (${u:0:40}...)"
         else
             ((fail++))
@@ -2227,13 +2222,24 @@ node_import() {
     echo ""
     _ok "导入完成: 成功 ${ok} 个, 失败 ${fail} 个"
 
-    # 若只导入了一个, 询问是否立即启用
-    if [[ "$ok" -eq 1 && -n "$first_id" ]]; then
+    if [[ "$ok" -gt 0 ]]; then
         echo ""
-        read -rp "  是否立即启用该节点 (作为代理出口)? [y/N]: " act
-        if [[ "$act" =~ ^[Yy]$ ]]; then
-            _activate_node "$first_id"
-            local tag; tag="$(_node_get "$first_id" active_tag)"
+        read -rp "  是否加入代理出口 (让 sing-box 可使用)? [Y/n]: " act
+        if [[ ! "$act" =~ ^[Nn]$ ]]; then
+            local added=0 add_failed=0 first_active_id=""
+            for id in "${imported_ids[@]}"; do
+                if _activate_node "$id"; then
+                    ((added++))
+                    [[ -z "$first_active_id" ]] && first_active_id="$id"
+                else
+                    ((add_failed++))
+                fi
+            done
+            [[ "$ok" -gt 1 ]] && _ok "加入代理出口完成: 成功 ${added} 个, 失败 ${add_failed} 个"
+            local tag=""
+            if [[ "$added" -eq 1 && -n "$first_active_id" ]]; then
+                tag="$(_node_get "$first_active_id" active_tag)"
+            fi
             if _node_active_tag_live "$tag"; then
                 read -rp "  是否将默认出口设为该节点? [y/N]: " setf
                 if [[ "$setf" =~ ^[Yy]$ ]]; then
@@ -2276,12 +2282,12 @@ list_chain_nodes() {
     _line
     local i=1
     while IFS=$'\t' read -r id name type server port active_tag; do
-        local status="${D}未启用${NC}"
+        local status="${D}未加入出口${NC}"
         if _node_active_tag_live "$active_tag"; then
             if _node_supported "$id"; then
-                status="${G}${active_tag}${NC}"
+                status="${G}代理出口: ${active_tag}${NC}"
             else
-                status="${Y}${active_tag} (暂不支持)${NC}"
+                status="${Y}代理出口: ${active_tag} (暂不支持)${NC}"
             fi
         elif [[ -n "$active_tag" && "$active_tag" != "null" ]]; then
             status="${Y}已失效${NC}"
@@ -2305,12 +2311,12 @@ _pick_node_id() {
     local id name type server port active_tag status
     while IFS=$'\t' read -r id name type server port active_tag; do
         [[ -z "$id" ]] && continue
-        status="未启用"
+        status="未加入出口"
         if _node_active_tag_live "$active_tag"; then
             if _node_supported "$id"; then
-                status="已启用: ${active_tag}"
+                status="代理出口: ${active_tag}"
             else
-                status="已启用但暂不支持: ${active_tag}"
+                status="代理出口暂不支持: ${active_tag}"
             fi
         elif [[ -n "$active_tag" && "$active_tag" != "null" ]]; then
             status="已失效"
@@ -2334,7 +2340,7 @@ _pick_node_id() {
 }
 
 manage_chain_node_state() {
-    _header "启用 / 停用节点"
+    _header "代理出口"
     _pick_node_id "选择节点" || { _warn "已取消"; _pause; return 1; }
 
     local id="$NODE_ID" name tag
@@ -2343,8 +2349,8 @@ manage_chain_node_state() {
 
     if _node_active_tag_live "$tag"; then
         if ! _node_supported "$id"; then
-            menu_select "节点 '${name}' 当前已启用但暂不支持" \
-                "停用节点并清理相关流量规则" \
+            menu_select "节点 '${name}' 已加入代理出口但暂不支持" \
+                "移出代理出口并清理相关流量规则" \
                 "返回"
             case "$MENU_CHOICE" in
                 1) _deactivate_node "$id" ;;
@@ -2354,8 +2360,8 @@ manage_chain_node_state() {
             return 0
         fi
 
-        menu_select "节点 '${name}' 当前已启用" \
-            "停用节点并清理相关流量规则" \
+        menu_select "节点 '${name}' 已加入代理出口" \
+            "移出代理出口并清理相关流量规则" \
             "设为默认出口" \
             "返回"
         case "$MENU_CHOICE" in
@@ -2400,38 +2406,6 @@ manage_chain_node_state() {
     _pause
 }
 
-activate_all_chain_nodes() {
-    _header "启用全部节点"
-    ensure_nodes
-    local total; total="$(_nodes_count)"
-    if [[ ! "$total" =~ ^[0-9]+$ || "$total" -eq 0 ]]; then
-        _warn "暂无节点。"
-        _pause
-        return 1
-    fi
-
-    read -rp "  将把所有未启用节点加入 outbounds, 继续? [y/N]: " ok
-    [[ "$ok" =~ ^[Yy]$ ]] || { _warn "已取消"; _pause; return 1; }
-
-    local id okn=0 failn=0
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
-        local tag; tag="$(_node_get "$id" active_tag)"
-        if _node_active_tag_live "$tag"; then
-            continue
-        fi
-        if _activate_node "$id"; then
-            ((okn++))
-        else
-            ((failn++))
-        fi
-    done < <(jq -r '.nodes[]?.id' "$NODES_FILE" 2>/dev/null)
-
-    _ok "启用完成: 新增 ${okn} 个, 失败 ${failn} 个"
-    _restart_if_running
-    _pause
-}
-
 delete_chain_node() {
     _header "删除链式代理节点"
     _pick_node_id "选择要删除的节点" || { _warn "已取消"; _pause; return 1; }
@@ -2439,7 +2413,7 @@ delete_chain_node() {
     local id="$NODE_ID" name tag
     name="$(_node_get "$id" name)"
     tag="$(_node_get "$id" active_tag)"
-    read -rp "  确认删除节点 '${name}'? 已启用出口和相关流量规则也会清理 [y/N]: " ok
+    read -rp "  确认删除节点 '${name}'? 已加入的代理出口和相关流量规则也会清理 [y/N]: " ok
     [[ "$ok" =~ ^[Yy]$ ]] || { _warn "已取消"; _pause; return 1; }
 
     if _node_active_tag_live "$tag"; then
@@ -2463,19 +2437,18 @@ delete_chain_node() {
 
 add_chain_proxy() {
     while true; do
-        _header "链式代理管理"
+        _header "代理节点"
         ensure_nodes
         ensure_config
         local total active
         total="$(_nodes_count)"
         active="$(_chain_active_count)"
-        echo -e "  节点库: ${W}${total}${NC} 个   已启用出口: ${W}${active}${NC} 个"
+        echo -e "  节点: ${W}${total}${NC} 个   代理出口: ${W}${active}${NC} 个"
         echo -e "  解析策略: ${W}$(_chain_domain_strategy_label)${NC}"
         echo ""
         menu_select "请选择操作" \
             "导入节点 (从 URL 粘贴)" \
-            "启用 / 停用节点" \
-            "启用全部节点" \
+            "加入 / 移出代理出口" \
             "设置链式代理解析策略" \
             "查看节点列表" \
             "删除节点" \
@@ -2483,10 +2456,9 @@ add_chain_proxy() {
         case "$MENU_CHOICE" in
             1) node_import ;;
             2) manage_chain_node_state ;;
-            3) activate_all_chain_nodes ;;
-            4) set_chain_domain_strategy ;;
-            5) list_chain_nodes ;;
-            6) delete_chain_node ;;
+            3) set_chain_domain_strategy ;;
+            4) list_chain_nodes ;;
+            5) delete_chain_node ;;
             *) return ;;
         esac
     done
@@ -2766,24 +2738,6 @@ list_outbounds_routes() {
     _pause
 }
 
-# 删除出口 / 规则
-remove_outbound_route() {
-    while true; do
-        _header "删除出口 / 规则"
-        menu_select "选择要删除的内容" \
-            "删除代理出口" \
-            "删除流量规则" \
-            "删除规则文件" \
-            "返回"
-        case "$MENU_CHOICE" in
-            1) _remove_outbound ;;
-            2) _remove_rule ;;
-            3) _remove_ruleset ;;
-            *) return ;;
-        esac
-    done
-}
-
 remove_rule_menu() {
     while true; do
         _header "删除流量规则"
@@ -2797,34 +2751,6 @@ remove_rule_menu() {
             *) return ;;
         esac
     done
-}
-
-_remove_outbound() {
-    local tags=() opts=() t
-    while IFS= read -r t; do [[ -n "$t" ]] && { tags+=("$t"); opts+=("$t"); }; done < <(_list_outbound_tags)
-    if [[ ${#tags[@]} -eq 0 ]]; then _warn "没有可删除的代理出口。"; _pause; return; fi
-    opts+=("取消")
-    menu_select "选择要删除的出口" "${opts[@]}"
-    local c="$MENU_CHOICE"
-    (( c < 1 || c > ${#tags[@]} )) && { _warn "已取消"; _pause; return; }
-    local tag="${tags[$((c-1))]}"
-    read -rp "  确认删除出口 '$tag'? 相关流量规则也会一并清理 [y/N]: " ok
-    [[ "$ok" =~ ^[Yy]$ ]] || { _warn "已取消"; _pause; return; }
-    if config_apply_checked --arg t "$tag" '
-        .outbounds = (.outbounds | map(select(.tag != $t))) |
-        .route.rules = ((.route.rules // []) | map(select(.outbound != $t))) |
-        ( if (.route.final // "") == $t then (.route.final = "direct") else . end )
-    '; then
-        _ok "已删除出口 $tag"
-    else
-        _err "删除出口失败 (未写入):"
-        _print_config_transition_error
-        _pause
-        return
-    fi
-    [[ -f "$NODES_FILE" ]] && nodes_apply --arg t "$tag" '(.nodes[]? | select(.active_tag == $t) | .active_tag) = ""' >/dev/null 2>&1
-    _restart_if_running
-    _pause
 }
 
 _remove_rule() {
@@ -3135,7 +3061,7 @@ uninstall_script() {
         echo -e "    · 删除脚本副本: ${W}${SELF_INSTALL_PATH}${NC}"
     fi
     echo ""
-    _warn "此操作会删除内核、服务、配置、节点库、证书和快捷命令。"
+    _warn "此操作会删除内核、服务、配置、节点列表、证书和快捷命令。"
     read -rp "  确认完全卸载? 输入 ${R}yes${NC} 继续: " confirm
     if [[ "$confirm" != "yes" ]]; then
         _warn "已取消"
