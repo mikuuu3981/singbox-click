@@ -606,21 +606,37 @@ core_remove() {
 core_menu() {
     while true; do
         _header "内核管理"
+        local has_core=0
         if core_installed; then
+            has_core=1
             echo -e "  状态: ${G}已安装${NC}  版本: ${W}$(core_version)${NC}"
         else
             echo -e "  状态: ${Y}未安装${NC}"
         fi
         echo ""
-        menu_select "请选择操作" \
-            "安装内核" \
-            "更新内核" \
-            "删除内核" \
-            "返回主菜单"
-        case "$MENU_CHOICE" in
-            1) core_install ;;
-            2) core_update ;;
-            3) core_remove ;;
+
+        local opts=() actions=()
+        if [[ "$has_core" == "1" ]]; then
+            opts+=("更新内核")
+            actions+=("update")
+            opts+=("删除内核")
+            actions+=("remove")
+        else
+            opts+=("安装内核")
+            actions+=("install")
+        fi
+        opts+=("返回主菜单")
+        actions+=("back")
+
+        menu_select "请选择操作" "${opts[@]}"
+        local action=""
+        if (( MENU_CHOICE >= 1 && MENU_CHOICE <= ${#actions[@]} )); then
+            action="${actions[$((MENU_CHOICE-1))]}"
+        fi
+        case "$action" in
+            install) core_install ;;
+            update) core_update ;;
+            remove) core_remove ;;
             *) return ;;
         esac
     done
@@ -2182,7 +2198,9 @@ node_import() {
     echo ""
 
     local line urls=()
-    while IFS= read -rp "  链接 (空行结束): " line; do
+    echo "  粘贴链接, 每行一个；输入空行开始导入:"
+    echo ""
+    while IFS= read -r line; do
         line="$(echo "$line" | tr -d '[:space:]')"
         [[ -z "$line" ]] && break
         urls+=("$line")
@@ -2689,17 +2707,30 @@ list_outbounds_routes() {
     _header "出口与流量规则"
     ensure_config
 
-    echo -e "  ${W}${BOLD}出口${NC}"
+    local finalv
+    finalv="$(jq -r '.route.final // empty' "$CONFIG_FILE" 2>/dev/null)"
+    [[ -z "$finalv" || "$finalv" == "null" ]] && finalv="$(jq -r '.outbounds[0].tag // .outbounds[0].type // "direct"' "$CONFIG_FILE" 2>/dev/null)"
+
+    echo -e "  ${W}${BOLD}当前默认${NC}"
     _line
+    echo -e "  未命中任何规则的流量 -> ${G}${finalv}${NC}"
+    echo ""
+
+    echo -e "  ${W}${BOLD}可用出口${NC}"
+    _line
+    printf "  %-6s ${C}%-24s${NC} %-12s ${D}%-24s %s${NC}\n" "用途" "名称" "类型" "地址" "备注"
     jq -r '.outbounds[]? |
         "\(.tag)|\(.type)|\(.server // "-")|\(.server_port // "-")|\(((if ((.domain_resolver // null) | type) == "object" then .domain_resolver.strategy else null end) // .domain_strategy // "-"))"' "$CONFIG_FILE" 2>/dev/null \
     | while IFS='|' read -r tag type srv sport ds; do
+        [[ -z "$tag" || "$tag" == "null" ]] && tag="$type"
         local extra=""; [[ "$srv" != "-" ]] && extra="${srv}:${sport}"
         local parse=""; [[ "$ds" != "-" ]] && parse="解析:${ds}"
-        printf "  ${C}%-24s${NC} %-12s ${D}%-24s %s${NC}\n" "$tag" "$type" "$extra" "$parse"
+        local role="可选"
+        [[ "$tag" == "$finalv" ]] && role="默认"
+        [[ "$tag" == "direct" && "$role" != "默认" ]] && role="直连"
+        [[ "$tag" == "block" ]] && role="拦截"
+        printf "  %-6s ${C}%-24s${NC} %-12s ${D}%-24s %s${NC}\n" "$role" "$tag" "$type" "$extra" "$parse"
     done
-    local finalv; finalv="$(jq -r '.route.final // "(未设置, 默认第一个出口)"' "$CONFIG_FILE" 2>/dev/null)"
-    echo -e "  ${D}默认出口: ${NC}${W}${finalv}${NC}"
 
     echo ""
     echo -e "  ${W}${BOLD}流量规则${NC}"
@@ -2748,6 +2779,21 @@ remove_outbound_route() {
             1) _remove_outbound ;;
             2) _remove_rule ;;
             3) _remove_ruleset ;;
+            *) return ;;
+        esac
+    done
+}
+
+remove_rule_menu() {
+    while true; do
+        _header "删除流量规则"
+        menu_select "请选择" \
+            "删除一条规则" \
+            "删除规则文件" \
+            "返回"
+        case "$MENU_CHOICE" in
+            1) _remove_rule ;;
+            2) _remove_ruleset ;;
             *) return ;;
         esac
     done
@@ -2837,7 +2883,6 @@ routing_menu() {
             "禁止回国流量" \
             "拦截广告" \
             "设置默认出口" \
-            "查看当前规则" \
             "添加规则文件" \
             "删除规则" \
             "返回"
@@ -2845,9 +2890,8 @@ routing_menu() {
             1) preset_block_cn ;;
             2) preset_block_ads ;;
             3) set_final_outbound ;;
-            4) list_outbounds_routes ;;
-            5) add_custom_srs ;;
-            6) remove_outbound_route ;;
+            4) add_custom_srs ;;
+            5) remove_rule_menu ;;
             *) return ;;
         esac
     done
@@ -2856,21 +2900,22 @@ routing_menu() {
 outbound_menu() {
     while true; do
         _header "出口 / 规则"
-        local oc="0"
+        local oc="0" rn="0" finalv=""
         [[ -f "$CONFIG_FILE" ]] && oc="$(jq -r '[.outbounds[]?|select(.type=="shadowsocks")]|length' "$CONFIG_FILE" 2>/dev/null)"
-        echo -e "  代理出口: ${W}${oc}${NC} 个"
+        [[ -f "$CONFIG_FILE" ]] && rn="$(jq -r '(.route.rules // []) | length' "$CONFIG_FILE" 2>/dev/null)"
+        [[ -f "$CONFIG_FILE" ]] && finalv="$(jq -r '.route.final // empty' "$CONFIG_FILE" 2>/dev/null)"
+        [[ -z "$finalv" || "$finalv" == "null" ]] && finalv="direct"
+        echo -e "  默认: ${W}${finalv}${NC}   代理: ${W}${oc}${NC} 个   规则: ${W}${rn}${NC} 条"
         echo ""
         menu_select "请选择" \
-            "链式代理节点" \
-            "流量规则" \
-            "查看出口与规则" \
-            "删除出口或规则" \
+            "代理节点" \
+            "流量设置" \
+            "查看状态" \
             "返回主菜单"
         case "$MENU_CHOICE" in
             1) add_chain_proxy ;;
             2) routing_menu ;;
             3) list_outbounds_routes ;;
-            4) remove_outbound_route ;;
             *) return ;;
         esac
     done
