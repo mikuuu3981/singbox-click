@@ -5,8 +5,8 @@
 #  功能:
 #    1. 内核管理  - 通过 SagerNet 官方 apt 源 下载 / 更新 / 删除 sing-box 内核
 #    2. 协议管理  - 安装 / 查看 / 删除代理协议 (AnyTLS / Shadowsocks, 需先安装内核)
-#    3. 链式代理  - 保存 / 启用 SS 与 SS2022 节点, 管理出站解析策略
-#    4. 分流规则  - 配置官方规则集 / 自定义 SRS / 默认出站
+#    3. 链式代理  - 保存 / 启用 SS 与 SS2022 节点, 管理出口解析策略
+#    4. 流量规则  - 禁止回国流量 / 广告拦截 / 默认出口
 #    5. 服务管理  - 启动 / 停止 / 重启 / 查看 systemd 服务
 #    6. 依赖自检  - 自动检测并安装缺失的基础依赖
 #
@@ -1539,7 +1539,7 @@ service_menu() {
 }
 
 #───────────────────────────────────────────────────────────────────────────────
-#  出站 / 分流管理 (链式代理)
+#  出口 / 规则管理 (链式代理)
 #───────────────────────────────────────────────────────────────────────────────
 # 官方规则集仓库 (sing-box rule-set, format=binary)
 readonly GEOSITE_BASE="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set"
@@ -1675,7 +1675,7 @@ set_chain_domain_strategy() {
         *) _warn "已取消"; _pause; return 1 ;;
     esac
 
-    # 仅同步 nodes.json 记录的已启用出站；未启用节点会在下次启用时使用新策略。
+    # 仅同步 nodes.json 记录的已启用出口；未启用节点会在下次启用时使用新策略。
     ensure_config
     local managed_tags use_resolver
     managed_tags="$(_chain_managed_tags_json)"
@@ -1693,7 +1693,7 @@ set_chain_domain_strategy() {
                 end
             ))
         ' || {
-            _err "同步已启用出站失败 (未写入):"
+            _err "同步已启用出口失败 (未写入):"
             _print_config_transition_error
             _pause
             return 1
@@ -1719,7 +1719,7 @@ set_chain_domain_strategy() {
                     end
                 ))
             ' || {
-                _err "同步已启用出站失败 (未写入):"
+                _err "同步已启用出口失败 (未写入):"
                 _print_config_transition_error
                 _pause
                 return 1
@@ -1737,7 +1737,7 @@ set_chain_domain_strategy() {
                     end
                 ))
             ' || {
-                _err "同步已启用出站失败 (未写入):"
+                _err "同步已启用出口失败 (未写入):"
                 _print_config_transition_error
                 _pause
                 return 1
@@ -1987,7 +1987,7 @@ _activate_node() {
     fi
 
     if ! nodes_apply --arg id "$id" --arg t "$tag" '(.nodes[]|select(.id==$id)|.active_tag)=$t'; then
-        _err "记录节点启用状态失败, 正在回滚出站。"
+        _err "记录节点启用状态失败, 正在回滚出口。"
         config_apply_checked --arg t "$tag" '
             .outbounds = ((.outbounds // []) | map(select(.tag != $t))) |
             .route.rules = ((.route.rules // []) | map(select(.outbound != $t))) |
@@ -1996,11 +1996,11 @@ _activate_node() {
         return 1
     fi
 
-    _ok "已启用节点: ${name} (出站 tag: ${tag})"
+    _ok "已启用节点: ${name} (出口 tag: ${tag})"
     return 0
 }
 
-# 停用节点: 从 config.json 移除其 outbound, 并清理相关规则/final。
+# 停用节点: 从 config.json 移除其出口, 并清理相关规则。
 _deactivate_node() {
     local id="$1"
     local tag; tag="$(_node_get "$id" active_tag)"
@@ -2014,7 +2014,7 @@ _deactivate_node() {
         .route.rules = ((.route.rules // []) | map(select(.outbound != $t))) |
         ( if (.route.final // "") == $t then (.route.final = "direct") else . end )
     '; then
-        _ok "已停用节点 (移除出站 $tag)"
+        _ok "已停用节点 (移除出口 $tag)"
     else
         _err "停用节点失败 (未写入):"
         _print_config_transition_error
@@ -2064,17 +2064,17 @@ node_import() {
     # 若只导入了一个, 询问是否立即启用
     if [[ "$ok" -eq 1 && -n "$first_id" ]]; then
         echo ""
-        read -rp "  是否立即启用该节点 (加入出站)? [y/N]: " act
+        read -rp "  是否立即启用该节点 (作为代理出口)? [y/N]: " act
         if [[ "$act" =~ ^[Yy]$ ]]; then
             _activate_node "$first_id"
             local tag; tag="$(_node_get "$first_id" active_tag)"
             if _node_active_tag_live "$tag"; then
-                read -rp "  是否将全部流量默认走此节点 (设为 final)? [y/N]: " setf
+                read -rp "  是否将默认出口设为该节点? [y/N]: " setf
                 if [[ "$setf" =~ ^[Yy]$ ]]; then
                     if _set_final_outbound_checked "$tag"; then
-                        _ok "已设为默认出站: $tag"
+                        _ok "已设为默认出口: $tag"
                     else
-                        _err "设置默认出站失败 (未写入):"
+                        _err "设置默认出口失败 (未写入):"
                         _print_config_transition_error
                     fi
                 fi
@@ -2178,7 +2178,7 @@ manage_chain_node_state() {
     if _node_active_tag_live "$tag"; then
         if ! _node_supported "$id"; then
             menu_select "节点 '${name}' 当前已启用但暂不支持" \
-                "停用节点并清理相关分流规则" \
+                "停用节点并清理相关流量规则" \
                 "返回"
             case "$MENU_CHOICE" in
                 1) _deactivate_node "$id" ;;
@@ -2189,8 +2189,8 @@ manage_chain_node_state() {
         fi
 
         menu_select "节点 '${name}' 当前已启用" \
-            "停用节点并清理相关分流规则" \
-            "设为默认出站 final" \
+            "停用节点并清理相关流量规则" \
+            "设为默认出口" \
             "返回"
         case "$MENU_CHOICE" in
             1)
@@ -2198,9 +2198,9 @@ manage_chain_node_state() {
                 ;;
             2)
                 if _set_final_outbound_checked "$tag"; then
-                    _ok "已设为默认出站: $tag"
+                    _ok "已设为默认出口: $tag"
                 else
-                    _err "设置默认出站失败 (未写入):"
+                    _err "设置默认出口失败 (未写入):"
                     _print_config_transition_error
                 fi
                 _restart_if_running
@@ -2220,12 +2220,12 @@ manage_chain_node_state() {
     _activate_node "$id"
     tag="$(_node_get "$id" active_tag)"
     if _node_active_tag_live "$tag"; then
-        read -rp "  是否将全部流量默认走此节点 (设为 final)? [y/N]: " setf
+        read -rp "  是否将默认出口设为该节点? [y/N]: " setf
         if [[ "$setf" =~ ^[Yy]$ ]]; then
             if _set_final_outbound_checked "$tag"; then
-                _ok "已设为默认出站: $tag"
+                _ok "已设为默认出口: $tag"
             else
-                _err "设置默认出站失败 (未写入):"
+                _err "设置默认出口失败 (未写入):"
                 _print_config_transition_error
             fi
         fi
@@ -2273,7 +2273,7 @@ delete_chain_node() {
     local id="$NODE_ID" name tag
     name="$(_node_get "$id" name)"
     tag="$(_node_get "$id" active_tag)"
-    read -rp "  确认删除节点 '${name}'? 已启用出站和相关分流规则也会清理 [y/N]: " ok
+    read -rp "  确认删除节点 '${name}'? 已启用出口和相关流量规则也会清理 [y/N]: " ok
     [[ "$ok" =~ ^[Yy]$ ]] || { _warn "已取消"; _pause; return 1; }
 
     if _node_active_tag_live "$tag"; then
@@ -2282,7 +2282,7 @@ delete_chain_node() {
             .route.rules = ((.route.rules // []) | map(select(.outbound != $t))) |
             ( if (.route.final // "") == $t then (.route.final = "direct") else . end )
         ' || {
-            _err "清理出站失败 (未写入):"
+            _err "清理出口失败 (未写入):"
             _print_config_transition_error
             _pause
             return 1
@@ -2303,7 +2303,7 @@ add_chain_proxy() {
         local total active
         total="$(_nodes_count)"
         active="$(_chain_active_count)"
-        echo -e "  节点库: ${W}${total}${NC} 个   已启用出站: ${W}${active}${NC} 个"
+        echo -e "  节点库: ${W}${total}${NC} 个   已启用出口: ${W}${active}${NC} 个"
         echo -e "  解析策略: ${W}$(_chain_domain_strategy_label)${NC}"
         echo ""
         menu_select "请选择操作" \
@@ -2339,13 +2339,13 @@ _restart_if_running() {
 # 可选项包含 direct/block 与当前支持的 SS/SS2022 链式代理出站。
 ROUTE_TARGET=""
 _pick_target_outbound() {
-    local title="${1:-选择该规则的目标出站}"
+    local title="${1:-选择目标出口}"
     local opts=("direct (直连)" "block (拦截)")
     local tags=("direct" "block")
     local t
     while IFS= read -r t; do
         [[ -z "$t" ]] && continue
-        opts+=("$t (链式代理)")
+        opts+=("$t (代理出口)")
         tags+=("$t")
     done < <(_list_chain_outbound_tags)
 
@@ -2378,11 +2378,11 @@ _add_ruleset_rule() {
     '
 }
 
-# 特色: 添加用户指定的 SRS 规则集 (远程 / 本地)
+# 特色: 添加用户指定的规则文件 (远程 / 本地)
 add_custom_srs() {
-    _header "添加自定义规则集 (SRS)"
+    _header "添加规则文件"
 
-    menu_select "规则集来源" \
+    menu_select "规则文件来源" \
         "远程 URL (自动下载)" \
         "本地文件 (服务器上的路径)"
     local kind
@@ -2392,25 +2392,23 @@ add_custom_srs() {
         *) _warn "已取消"; _pause; return 1 ;;
     esac
 
-    # 规则集 tag
     local rtag
-    read -rp "  规则集名称 (tag, 字母数字): " rtag
+    read -rp "  规则名称 (字母数字): " rtag
     rtag="$(_sanitize_tag "$rtag")"
     if [[ -z "$rtag" || "$rtag" == "node" ]]; then
-        _err "规则集名称无效。"; _pause; return 1
+        _err "规则名称无效。"; _pause; return 1
     fi
     if jq -e --arg t "$rtag" '[.route.rule_set[]?|select(.tag==$t)]|length>0' "$CONFIG_FILE" >/dev/null 2>&1; then
-        _warn "规则集 '$rtag' 已存在, 将被覆盖更新。"
+        _warn "规则 '$rtag' 已存在, 将被覆盖更新。"
     fi
 
     local src fmt
     if [[ "$kind" == "remote" ]]; then
-        read -rp "  规则集 URL (.srs 或 .json): " src
+        read -rp "  规则文件 URL (.srs 或 .json): " src
         if [[ ! "$src" =~ ^https?:// ]]; then
             _err "无效 URL, 必须以 http:// 或 https:// 开头。"; _pause; return 1
         fi
-        # 格式
-        menu_select "规则集格式" "binary (.srs, 推荐)" "source (.json)"
+        menu_select "规则文件格式" "二进制规则 (.srs, 推荐)" "JSON 规则 (.json)"
         case "$MENU_CHOICE" in
             1) fmt="binary" ;;
             2) fmt="source" ;;
@@ -2426,7 +2424,7 @@ add_custom_srs() {
             _warn "URL 暂时无法访问 (HTTP ${code:-连接失败})。仍会写入, 但服务启动时可能下载失败。"
         fi
     else
-        read -rp "  本地规则集文件绝对路径: " src
+        read -rp "  本地规则文件绝对路径: " src
         if [[ ! -f "$src" ]]; then
             _err "文件不存在: $src"; _pause; return 1
         fi
@@ -2435,7 +2433,7 @@ add_custom_srs() {
             *.srs)  fmt="binary" ;;
             *.json) fmt="source" ;;
             *)
-                menu_select "无法从扩展名判断, 请选择格式" "binary (.srs)" "source (.json)"
+                menu_select "无法从扩展名判断, 请选择格式" "二进制规则 (.srs)" "JSON 规则 (.json)"
                 case "$MENU_CHOICE" in
                     1) fmt="binary" ;;
                     2) fmt="source" ;;
@@ -2445,14 +2443,13 @@ add_custom_srs() {
         esac
         # source 格式校验 JSON
         if [[ "$fmt" == "source" ]] && ! jq empty "$src" 2>/dev/null; then
-            _err "该文件不是有效 JSON, 无法作为 source 规则集。"; _pause; return 1
+            _err "该文件不是有效 JSON, 无法作为 JSON 规则文件。"; _pause; return 1
         fi
-        _ok "本地规则集有效: $src ($fmt)"
+        _ok "本地规则文件有效: $src ($fmt)"
     fi
 
-    # 目标出站
     echo ""
-    _pick_target_outbound "命中该规则集的流量走哪个出站?" || { _warn "已取消"; _pause; return 1; }
+    _pick_target_outbound "命中这个规则文件的流量走哪个出口?" || { _warn "已取消"; _pause; return 1; }
 
     if _add_ruleset_rule "$rtag" "$src" "$kind" "$fmt" "$ROUTE_TARGET"; then
         _ok "规则已添加并校验通过: [$rtag] -> $ROUTE_TARGET"
@@ -2467,32 +2464,26 @@ add_custom_srs() {
     return 0
 }
 
-# 预设: 国内直连, 其余走代理
-preset_cn_direct() {
-    _header "预设: 国内直连 / 其余走代理"
+# 预设: 禁止服务器回国流量
+preset_block_cn() {
+    _header "禁止回国流量"
 
-    if [[ -z "$(_list_chain_outbound_tags)" ]]; then
-        _err "尚无可用的 SS / SS2022 链式代理出站, 请先「添加链式代理」。"
-        _pause; return 1
-    fi
-    _pick_target_outbound "国外流量走哪个代理出站?" || { _warn "已取消"; _pause; return 1; }
-    local proxy="$ROUTE_TARGET"
+    read -rp "  将阻止访问中国 IP / 域名的流量, 继续? [y/N]: " ok
+    [[ "$ok" =~ ^[Yy]$ ]] || { _warn "已取消"; _pause; return 1; }
 
-    # 添加 geoip-cn / geosite-cn 规则集与规则, final=proxy
     local rs_geoip rs_geosite
     rs_geoip="$(jq -n --arg u "${GEOIP_BASE}/geoip-cn.srs" '{type:"remote",tag:"geoip-cn",format:"binary",url:$u,download_detour:"direct"}')"
     rs_geosite="$(jq -n --arg u "${GEOSITE_BASE}/geosite-cn.srs" '{type:"remote",tag:"geosite-cn",format:"binary",url:$u,download_detour:"direct"}')"
 
-    if config_apply_checked --argjson a "$rs_geoip" --argjson b "$rs_geosite" --arg proxy "$proxy" '
+    if config_apply_checked --argjson a "$rs_geoip" --argjson b "$rs_geosite" '
         .outbounds //= [] | .route //= {} | .route.rules //= [] | .route.rule_set //= [] |
         ( if ([.outbounds[]?.tag] | index("direct")) then . else .outbounds += [{"type":"direct","tag":"direct"}] end ) |
         ( if ([.outbounds[]?.tag] | index("block"))  then . else .outbounds += [{"type":"block","tag":"block"}] end ) |
         .route.rule_set = ((.route.rule_set // []) | map(select(.tag!="geoip-cn" and .tag!="geosite-cn")) + [$a,$b]) |
-        .route.rules   = ((.route.rules // []) | map(select((.rule_set // []) | (index("geoip-cn")|not) and (index("geosite-cn")|not)))
-                           + [{ rule_set:["geoip-cn","geosite-cn"], outbound:"direct" }]) |
-        .route.final = $proxy
+        .route.rules   = ([{ rule_set:["geoip-cn","geosite-cn"], outbound:"block" }]
+                           + ((.route.rules // []) | map(select((.rule_set // []) | (index("geoip-cn")|not) and (index("geosite-cn")|not)))))
     '; then
-        _ok "已配置: 国内(geoip-cn/geosite-cn)直连, 其余走 ${proxy}"
+        _ok "已配置: geoip-cn/geosite-cn -> block"
         _restart_if_running
     else
         _err "配置校验失败 (未写入):"
@@ -2505,7 +2496,7 @@ preset_cn_direct() {
 
 # 预设: 广告拦截
 preset_block_ads() {
-    _header "预设: 广告拦截"
+    _header "拦截广告"
     local rs
     rs="$(jq -n --arg u "${GEOSITE_BASE}/geosite-category-ads-all.srs" '{type:"remote",tag:"geosite-ads",format:"binary",url:$u,download_detour:"direct"}')"
     if config_apply_checked --argjson rs "$rs" '
@@ -2527,26 +2518,26 @@ preset_block_ads() {
     _pause
 }
 
-# 设置默认出站 final
+# 设置默认出口
 set_final_outbound() {
-    _header "设置默认出站 (final)"
-    _pick_target_outbound "未命中任何规则的流量走哪个出站?" || { _warn "已取消"; _pause; return; }
+    _header "设置默认出口"
+    _pick_target_outbound "没有匹配规则时, 流量走哪个出口?" || { _warn "已取消"; _pause; return; }
     if _set_final_outbound_checked "$ROUTE_TARGET"; then
-        _ok "默认出站已设为: $ROUTE_TARGET"
+        _ok "默认出口已设为: $ROUTE_TARGET"
     else
-        _err "设置默认出站失败 (未写入):"
+        _err "设置默认出口失败 (未写入):"
         _print_config_transition_error
     fi
     _restart_if_running
     _pause
 }
 
-# 查看出站与路由
+# 查看出口与规则
 list_outbounds_routes() {
-    _header "出站与分流规则"
+    _header "出口与流量规则"
     ensure_config
 
-    echo -e "  ${W}${BOLD}出站 (outbounds)${NC}"
+    echo -e "  ${W}${BOLD}出口${NC}"
     _line
     jq -r '.outbounds[]? |
         "\(.tag)|\(.type)|\(.server // "-")|\(.server_port // "-")|\(((if ((.domain_resolver // null) | type) == "object" then .domain_resolver.strategy else null end) // .domain_strategy // "-"))"' "$CONFIG_FILE" 2>/dev/null \
@@ -2555,33 +2546,33 @@ list_outbounds_routes() {
         local parse=""; [[ "$ds" != "-" ]] && parse="解析:${ds}"
         printf "  ${C}%-24s${NC} %-12s ${D}%-24s %s${NC}\n" "$tag" "$type" "$extra" "$parse"
     done
-    local finalv; finalv="$(jq -r '.route.final // "(未设置, 默认第一个出站)"' "$CONFIG_FILE" 2>/dev/null)"
-    echo -e "  ${D}默认出站 final: ${NC}${W}${finalv}${NC}"
+    local finalv; finalv="$(jq -r '.route.final // "(未设置, 默认第一个出口)"' "$CONFIG_FILE" 2>/dev/null)"
+    echo -e "  ${D}默认出口: ${NC}${W}${finalv}${NC}"
 
     echo ""
-    echo -e "  ${W}${BOLD}分流规则 (route.rules)${NC}"
+    echo -e "  ${W}${BOLD}流量规则${NC}"
     _line
     local rn
     rn="$(jq -r '.route.rules|length' "$CONFIG_FILE" 2>/dev/null)"
     if [[ ! "$rn" =~ ^[0-9]+$ || "$rn" -eq 0 ]]; then
-        _dim "(无分流规则)"
+        _dim "(无流量规则)"
     else
         jq -r '.route.rules | to_entries[] |
             "\(.key+1)|\((.value.rule_set // [] | join(","))// "-")|\(.value.domain_suffix // [] | join(","))|\(.value.outbound // "-")"' \
             "$CONFIG_FILE" 2>/dev/null | while IFS='|' read -r idx rs ds out; do
             local match="$rs"; [[ -z "$match" || "$match" == "-" ]] && match="$ds"
             [[ -z "$match" ]] && match="(其它)"
-            printf "  %-3s rule_set/条件: ${C}%-28s${NC} -> ${G}%s${NC}\n" "$idx" "$match" "$out"
+            printf "  %-3s 条件: ${C}%-28s${NC} -> 出口: ${G}%s${NC}\n" "$idx" "$match" "$out"
         done
     fi
 
     echo ""
-    echo -e "  ${W}${BOLD}规则集 (route.rule_set)${NC}"
+    echo -e "  ${W}${BOLD}规则文件${NC}"
     _line
     local sn
     sn="$(jq -r '.route.rule_set|length' "$CONFIG_FILE" 2>/dev/null)"
     if [[ ! "$sn" =~ ^[0-9]+$ || "$sn" -eq 0 ]]; then
-        _dim "(无规则集)"
+        _dim "(无规则文件)"
     else
         jq -r '.route.rule_set[]? | "\(.tag)|\(.type)|\(.format)|\(.url // .path // "-")"' "$CONFIG_FILE" 2>/dev/null \
         | while IFS='|' read -r tag type fmt loc; do
@@ -2592,14 +2583,14 @@ list_outbounds_routes() {
     _pause
 }
 
-# 删除出站 / 规则
+# 删除出口 / 规则
 remove_outbound_route() {
     while true; do
-        _header "删除出站 / 规则"
+        _header "删除出口 / 规则"
         menu_select "选择要删除的内容" \
-            "删除链式代理出站" \
-            "删除一条分流规则" \
-            "删除一个规则集" \
+            "删除代理出口" \
+            "删除流量规则" \
+            "删除规则文件" \
             "返回"
         case "$MENU_CHOICE" in
             1) _remove_outbound ;;
@@ -2613,22 +2604,22 @@ remove_outbound_route() {
 _remove_outbound() {
     local tags=() opts=() t
     while IFS= read -r t; do [[ -n "$t" ]] && { tags+=("$t"); opts+=("$t"); }; done < <(_list_outbound_tags)
-    if [[ ${#tags[@]} -eq 0 ]]; then _warn "没有可删除的链式代理出站。"; _pause; return; fi
+    if [[ ${#tags[@]} -eq 0 ]]; then _warn "没有可删除的代理出口。"; _pause; return; fi
     opts+=("取消")
-    menu_select "选择要删除的出站" "${opts[@]}"
+    menu_select "选择要删除的出口" "${opts[@]}"
     local c="$MENU_CHOICE"
     (( c < 1 || c > ${#tags[@]} )) && { _warn "已取消"; _pause; return; }
     local tag="${tags[$((c-1))]}"
-    read -rp "  确认删除出站 '$tag'? 相关分流规则/final 也会一并清理 [y/N]: " ok
+    read -rp "  确认删除出口 '$tag'? 相关流量规则也会一并清理 [y/N]: " ok
     [[ "$ok" =~ ^[Yy]$ ]] || { _warn "已取消"; _pause; return; }
     if config_apply_checked --arg t "$tag" '
         .outbounds = (.outbounds | map(select(.tag != $t))) |
         .route.rules = ((.route.rules // []) | map(select(.outbound != $t))) |
         ( if (.route.final // "") == $t then (.route.final = "direct") else . end )
     '; then
-        _ok "已删除出站 $tag"
+        _ok "已删除出口 $tag"
     else
-        _err "删除出站失败 (未写入):"
+        _err "删除出口失败 (未写入):"
         _print_config_transition_error
         _pause
         return
@@ -2641,7 +2632,7 @@ _remove_outbound() {
 _remove_rule() {
     local rn
     rn="$(jq -r '.route.rules|length' "$CONFIG_FILE" 2>/dev/null)"
-    if [[ ! "$rn" =~ ^[0-9]+$ || "$rn" -eq 0 ]]; then _warn "没有分流规则。"; _pause; return; fi
+    if [[ ! "$rn" =~ ^[0-9]+$ || "$rn" -eq 0 ]]; then _warn "没有流量规则。"; _pause; return; fi
     local opts=() i
     while IFS= read -r i; do opts+=("$i"); done < <(jq -r '.route.rules|to_entries[]|
         "#\(.key+1)  \((.value.rule_set // [] | join(","))) \((.value.domain_suffix // [] | join(","))) -> \(.value.outbound // "-")"' "$CONFIG_FILE")
@@ -2664,9 +2655,9 @@ _remove_rule() {
 _remove_ruleset() {
     local tags=() opts=() t
     while IFS= read -r t; do [[ -n "$t" ]] && { tags+=("$t"); opts+=("$t"); }; done < <(jq -r '.route.rule_set[]?.tag' "$CONFIG_FILE" 2>/dev/null)
-    if [[ ${#tags[@]} -eq 0 ]]; then _warn "没有规则集。"; _pause; return; fi
+    if [[ ${#tags[@]} -eq 0 ]]; then _warn "没有规则文件。"; _pause; return; fi
     opts+=("取消")
-    menu_select "选择要删除的规则集" "${opts[@]}"
+    menu_select "选择要删除的规则文件" "${opts[@]}"
     local c="$MENU_CHOICE"
     (( c < 1 || c > ${#tags[@]} )) && { _warn "已取消"; _pause; return; }
     local tag="${tags[$((c-1))]}"
@@ -2674,9 +2665,9 @@ _remove_ruleset() {
         .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $t))) |
         .route.rules = ((.route.rules // []) | map(select((.rule_set // []) | (index($t)|not))))
     '; then
-        _ok "已删除规则集 $tag (及引用它的规则)"
+        _ok "已删除规则文件 $tag (及引用它的规则)"
     else
-        _err "删除规则集失败 (未写入):"
+        _err "删除规则文件失败 (未写入):"
         _print_config_transition_error
         _pause
         return
@@ -2687,23 +2678,23 @@ _remove_ruleset() {
 
 routing_menu() {
     while true; do
-        _header "分流设置"
-        _dim "预设规则依赖官方 geosite/geoip 规则集 (首次启动会自动下载)"
+        _header "流量规则"
+        _dim "规则从上到下匹配；没有匹配时走默认出口。"
         echo ""
-        menu_select "请选择操作" \
-            "预设: 国内直连 / 其余走代理" \
-            "预设: 广告拦截" \
-            "添加自定义规则集 (SRS 远程/本地)" \
-            "设置默认出站 (final)" \
-            "查看出站与规则" \
-            "删除出站 / 规则" \
+        menu_select "请选择" \
+            "禁止回国流量" \
+            "拦截广告" \
+            "设置默认出口" \
+            "查看当前规则" \
+            "添加规则文件" \
+            "删除规则" \
             "返回"
         case "$MENU_CHOICE" in
-            1) preset_cn_direct ;;
+            1) preset_block_cn ;;
             2) preset_block_ads ;;
-            3) add_custom_srs ;;
-            4) set_final_outbound ;;
-            5) list_outbounds_routes ;;
+            3) set_final_outbound ;;
+            4) list_outbounds_routes ;;
+            5) add_custom_srs ;;
             6) remove_outbound_route ;;
             *) return ;;
         esac
@@ -2712,16 +2703,16 @@ routing_menu() {
 
 outbound_menu() {
     while true; do
-        _header "出站 / 分流管理"
+        _header "出口 / 规则"
         local oc="0"
         [[ -f "$CONFIG_FILE" ]] && oc="$(jq -r '[.outbounds[]?|select(.type=="shadowsocks")]|length' "$CONFIG_FILE" 2>/dev/null)"
-        echo -e "  链式代理出站: ${W}${oc}${NC} 个"
+        echo -e "  代理出口: ${W}${oc}${NC} 个"
         echo ""
-        menu_select "请选择功能" \
-            "链式代理管理 (导入 / 启用 / 解析策略)" \
-            "分流设置 (规则 / 自定义 SRS)" \
-            "查看出站与规则" \
-            "删除出站 / 规则" \
+        menu_select "请选择" \
+            "链式代理节点" \
+            "流量规则" \
+            "查看出口与规则" \
+            "删除出口或规则" \
             "返回主菜单"
         case "$MENU_CHOICE" in
             1) add_chain_proxy ;;
@@ -2966,7 +2957,7 @@ main_menu() {
             opts+=("协议管理")
             actions+=("protocol")
         fi
-        opts+=("出站 / 分流")
+        opts+=("出口 / 规则")
         actions+=("outbound")
         opts+=("服务管理")
         actions+=("service")
