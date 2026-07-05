@@ -20,11 +20,15 @@ set -o pipefail
 
 readonly SCRIPT_VERSION="1.0.0"
 readonly APP_NAME="singbox-click"
+readonly GITHUB_REPO="mikuuu3981/singbox-click"
+readonly GITHUB_API_REPO="https://api.github.com/repos/${GITHUB_REPO}"
+readonly GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO}"
 readonly CONFIG_DIR="/etc/singbox-click"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
 readonly CERT_DIR="${CONFIG_DIR}/certs"
 readonly NODES_FILE="${CONFIG_DIR}/nodes.json"
 readonly CHAIN_DOMAIN_STRATEGY_FILE="${CONFIG_DIR}/chain-domain-strategy"
+readonly CHAIN_DOMAIN_RESOLVER_TAG="${APP_NAME}-local"
 readonly SINGBOX_DIR="/etc/sing-box"
 readonly SINGBOX_CONFIG_FILE="${SINGBOX_DIR}/config.json"
 readonly SERVICE="sing-box"
@@ -33,7 +37,7 @@ readonly SERVICE="sing-box"
 #   /etc/singbox-click/config.json              singbox-click 管理的运行配置
 #   /etc/sing-box/config.json                   指向上述配置的兼容链接, 供官方服务读取
 #   nodes.json               链式代理节点库, 与运行配置解耦
-#   chain-domain-strategy    chain-* 出站的 domain_strategy 默认值
+#   chain-domain-strategy    chain-* 出站访问域名时的解析策略
 
 # 脚本自安装 / 快捷命令
 readonly SELF_INSTALL_DIR="/usr/local/bin"
@@ -276,8 +280,6 @@ menu_select() {
     _render_menu() {
         local i CLR=$'\e[K'
         printf '  %s%s%s%s\n' "$W$BOLD" "$title" "$NC" "$CLR"
-        printf '  %s↑/↓ 选择 · Enter 确认 · q 返回 (或直接输入数字)%s%s\n' "$D" "$NC" "$CLR"
-        printf '%s\n' "$CLR"
         for i in "${!options[@]}"; do
             if [[ $i -eq $sel ]]; then
                 printf '  %s❯ %d. %s%s%s\n' "$G$BOLD" "$((i+1))" "${options[$i]}" "$NC" "$CLR"
@@ -288,7 +290,7 @@ menu_select() {
     }
 
     _render_menu
-    local lines=$((count + 3))
+    local lines=$((count + 1))
     local esc rest
 
     while true; do
@@ -689,6 +691,95 @@ ensure_singbox_config_link() {
     ln -s "$CONFIG_FILE" "$SINGBOX_CONFIG_FILE"
 }
 
+_chain_domain_resolver_supported() {
+    local cur
+    cur="$(core_semver)"
+    [[ -z "$cur" ]] && return 0
+    version_ge "$cur" "1.12.0"
+}
+
+_chain_managed_tags_json() {
+    if [[ -f "$NODES_FILE" ]]; then
+        jq -c '[.nodes[]?.active_tag | select(type == "string" and length > 0)] | unique' "$NODES_FILE" 2>/dev/null || echo '[]'
+    else
+        echo '[]'
+    fi
+}
+
+_migrate_legacy_chain_domain_strategy_options() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+
+    local legacy_count use_resolver managed_tags tmp check_out
+    managed_tags="$(_chain_managed_tags_json)"
+    legacy_count="$(jq -r --argjson managed_tags "$managed_tags" '
+        [.outbounds[]? |
+            (.tag // "") as $tag |
+            select(
+                ((($managed_tags | index($tag)) != null) or ($tag | startswith("chain-"))) and
+                (has("domain_strategy") or has("domain_resolver"))
+            )
+        ] | length
+    ' "$CONFIG_FILE" 2>/dev/null)" || return 0
+    [[ "$legacy_count" =~ ^[0-9]+$ && "$legacy_count" -gt 0 ]] || return 0
+    use_resolver=0
+    _chain_domain_resolver_supported && use_resolver=1
+
+    tmp="$(mktemp "${CONFIG_DIR}/.config.json.XXXXXX")" || return 1
+    if jq --arg resolver "$CHAIN_DOMAIN_RESOLVER_TAG" \
+        --arg use_resolver "$use_resolver" \
+        --argjson managed_tags "$managed_tags" '
+        def valid_strategy:
+            . == "prefer_ipv4" or . == "prefer_ipv6" or . == "ipv4_only" or . == "ipv6_only";
+        def managed_chain:
+            (.tag // "") as $tag |
+            (($managed_tags | index($tag)) != null) or
+            (($tag | startswith("chain-")) and has("domain_strategy"));
+
+        .outbounds = ((.outbounds // []) | map(
+            if managed_chain then
+                if $use_resolver == "1" then
+                    if ((.domain_strategy // "") | valid_strategy) then
+                        .domain_resolver = {server:$resolver, strategy:.domain_strategy} |
+                        del(.domain_strategy)
+                    else
+                        del(.domain_strategy)
+                    end
+                else
+                    if ((((.domain_resolver // {}) | .strategy) // "") | valid_strategy) then
+                        .domain_strategy = .domain_resolver.strategy |
+                        del(.domain_resolver)
+                    else
+                        del(.domain_resolver)
+                    end
+                end
+            else
+                .
+            end
+        )) |
+        if $use_resolver == "1" and
+           ([.outbounds[]? | select(((((.domain_resolver // {}) | .server) // "") == $resolver))] | length) > 0
+        then
+            .dns //= {} |
+            .dns.servers //= [] |
+            if ([.dns.servers[]? | select((.tag // "") == $resolver and (.type // "") != "local")] | length) > 0 then
+                error("DNS 解析器 tag 冲突: " + $resolver)
+            elif ([.dns.servers[]?.tag] | index($resolver)) then .
+            else .dns.servers += [{type:"local", tag:$resolver}]
+            end
+        else .
+        end
+    ' "$CONFIG_FILE" >"$tmp" 2>/dev/null; then
+        if check_out="$(config_check_file "$tmp")"; then
+            mv "$tmp" "$CONFIG_FILE"
+            secure_config_permissions
+            return 0
+        fi
+    fi
+
+    rm -f "$tmp"
+    return 1
+}
+
 ensure_config() {
     migrate_legacy_config_dir
     mkdir -p "$CONFIG_DIR" "$CERT_DIR"
@@ -706,36 +797,63 @@ ensure_config() {
 }
 EOF
     fi
+    _migrate_legacy_chain_domain_strategy_options || _warn "旧版链式代理解析配置迁移失败, 请手动检查 ${CONFIG_FILE}"
     if core_installed; then
         ensure_singbox_config_link
     fi
     secure_config_permissions
 }
 
-# 原子写入: 用 jq 表达式改写 config.json
-# 用法: config_apply <jq-args...> '<filter>'
-config_apply() {
+CONFIG_TRANSITION_ERROR=""
+
+# checked transition: 先在临时文件生成目标状态并校验, 通过后才替换正式配置。
+config_check_file() {
+    local file="${1:-$CONFIG_FILE}"
+    if core_installed; then
+        sing-box check -c "$file" 2>&1
+        return $?
+    fi
+    jq empty "$file" 2>&1
+}
+
+config_apply_checked() {
     ensure_config
-    local tmp
-    tmp="$(mktemp)" || return 1
-    if jq "$@" "$CONFIG_FILE" >"$tmp" 2>/dev/null; then
-        mv "$tmp" "$CONFIG_FILE"
+    CONFIG_TRANSITION_ERROR=""
+
+    local tmp errf check_out
+    tmp="$(mktemp "${CONFIG_DIR}/.config.json.XXXXXX")" || return 1
+    errf="$(mktemp)" || { rm -f "$tmp"; return 1; }
+
+    if ! jq "$@" "$CONFIG_FILE" >"$tmp" 2>"$errf"; then
+        CONFIG_TRANSITION_ERROR="$(cat "$errf")"
+        rm -f "$tmp" "$errf"
+        return 1
+    fi
+    rm -f "$errf"
+
+    if ! check_out="$(config_check_file "$tmp")"; then
+        CONFIG_TRANSITION_ERROR="$check_out"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if mv "$tmp" "$CONFIG_FILE"; then
         secure_config_permissions
         return 0
     fi
+
     rm -f "$tmp"
-    _err "写入配置失败 (jq 表达式错误或配置损坏)。"
+    CONFIG_TRANSITION_ERROR="无法替换 ${CONFIG_FILE}"
     return 1
+}
+
+_print_config_transition_error() {
+    [[ -n "$CONFIG_TRANSITION_ERROR" ]] && echo "$CONFIG_TRANSITION_ERROR" | sed 's/^/    /'
 }
 
 # 校验配置 (需内核已安装)
 config_check() {
-    if core_installed; then
-        sing-box check -c "$CONFIG_FILE" 2>&1
-        return $?
-    fi
-    # 无内核时退化为 JSON 语法检查
-    jq empty "$CONFIG_FILE" 2>&1
+    config_check_file "$CONFIG_FILE"
 }
 
 # tag 是否已存在
@@ -975,22 +1093,15 @@ install_anytls() {
             }
         }')"
 
-    if ! config_apply --argjson ib "$inbound" '.inbounds += [$ib]'; then
-        _err "写入配置失败。"
-        _pause
-        return 1
-    fi
-
-    # --- 校验配置 ---
     echo ""
     _info "校验配置..."
-    local check_out
-    if check_out="$(config_check)"; then
-        _ok "配置校验通过"
+    if config_apply_checked --argjson ib "$inbound" '.inbounds += [$ib]'; then
+        _ok "配置已写入并校验通过"
     else
-        _err "配置校验失败:"
-        echo "$check_out" | sed 's/^/    /'
-        _warn "已写入配置但存在问题, 请检查后再启动服务。"
+        _err "配置校验失败 (未写入):"
+        _print_config_transition_error
+        _pause
+        return 1
     fi
 
     # --- 启动/重启服务 ---
@@ -1102,39 +1213,27 @@ install_shadowsocks() {
             password: $password
         }')"
 
-    if ! config_apply --argjson ib "$inbound" '.inbounds += [$ib]'; then
-        _err "写入配置失败。"
+    echo ""
+    _info "校验配置..."
+    if config_apply_checked --argjson ib "$inbound" '.inbounds += [$ib]'; then
+        _ok "配置已写入并校验通过"
+    else
+        _err "配置校验失败 (未写入):"
+        _print_config_transition_error
         _pause
         return 1
     fi
 
-    # --- 校验配置 ---
-    echo ""
-    _info "校验配置..."
-    local check_out config_ok=0
-    if check_out="$(config_check)"; then
-        config_ok=1
-        _ok "配置校验通过"
-    else
-        _err "配置校验失败:"
-        echo "$check_out" | sed 's/^/    /'
-        _warn "已写入配置但存在问题, 请检查后再启动服务。"
-    fi
-
     # --- 启动/重启服务 ---
-    if [[ "$config_ok" == "1" ]]; then
-        _info "启用并重启 sing-box 服务..."
-        systemctl enable "$SERVICE" >/dev/null 2>&1
-        if systemctl restart "$SERVICE" 2>/dev/null; then
-            sleep 1
-            if systemctl is-active --quiet "$SERVICE"; then
-                _ok "服务运行中"
-            else
-                _err "服务启动失败, 查看日志: journalctl -u ${SERVICE} -e"
-            fi
+    _info "启用并重启 sing-box 服务..."
+    systemctl enable "$SERVICE" >/dev/null 2>&1
+    if systemctl restart "$SERVICE" 2>/dev/null; then
+        sleep 1
+        if systemctl is-active --quiet "$SERVICE"; then
+            _ok "服务运行中"
+        else
+            _err "服务启动失败, 查看日志: journalctl -u ${SERVICE} -e"
         fi
-    else
-        _warn "配置未通过校验, 已跳过服务重启。"
     fi
 
     # --- 输出分享信息 ---
@@ -1349,7 +1448,12 @@ remove_protocol() {
         return
     fi
 
-    config_apply --argjson i "$idx" 'del(.inbounds[$i])' || { _pause; return; }
+    if ! config_apply_checked --argjson i "$idx" 'del(.inbounds[$i])'; then
+        _err "删除协议失败 (未写入):"
+        _print_config_transition_error
+        _pause
+        return
+    fi
     _ok "已从配置移除 ${tag}"
 
     # 仅删除本脚本自签目录内的证书, 避免误删用户真实证书
@@ -1506,7 +1610,7 @@ _sanitize_tag() {
 }
 
 # 读取链式代理访问远端节点域名时的解析策略。
-# as_is 表示不写 domain_strategy, 交给 sing-box 默认行为。
+# as_is 表示不写 domain_resolver, 交给 sing-box 默认行为。
 _chain_domain_strategy() {
     local ds=""
     [[ -f "$CHAIN_DOMAIN_STRATEGY_FILE" ]] && ds="$(tr -d '[:space:]' < "$CHAIN_DOMAIN_STRATEGY_FILE" 2>/dev/null)"
@@ -1526,13 +1630,27 @@ _chain_domain_strategy_label() {
     esac
 }
 
+_write_chain_domain_strategy() {
+    local ds="$1" tmp
+    mkdir -p "$CONFIG_DIR"
+    tmp="$(mktemp "${CONFIG_DIR}/.chain-domain-strategy.XXXXXX")" || return 1
+    printf '%s\n' "$ds" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$CHAIN_DOMAIN_STRATEGY_FILE" || { rm -f "$tmp"; return 1; }
+    secure_config_permissions
+}
+
 _apply_chain_domain_strategy_to_outbound() {
     local ob="$1" ds
     ds="$(_chain_domain_strategy)"
     if [[ "$ds" == "as_is" ]]; then
-        echo "$ob" | jq 'del(.domain_strategy)'
+        echo "$ob" | jq 'del(.domain_strategy, .domain_resolver)'
+    elif _chain_domain_resolver_supported; then
+        echo "$ob" | jq --arg resolver "$CHAIN_DOMAIN_RESOLVER_TAG" --arg ds "$ds" '
+            .domain_resolver = {server:$resolver, strategy:$ds} |
+            del(.domain_strategy)
+        '
     else
-        echo "$ob" | jq --arg ds "$ds" '.domain_strategy=$ds'
+        echo "$ob" | jq --arg ds "$ds" '.domain_strategy=$ds | del(.domain_resolver)'
     fi
 }
 
@@ -1557,19 +1675,80 @@ set_chain_domain_strategy() {
         *) _warn "已取消"; _pause; return 1 ;;
     esac
 
-    mkdir -p "$CONFIG_DIR"
-    printf '%s\n' "$ds" > "$CHAIN_DOMAIN_STRATEGY_FILE"
-    secure_config_permissions
+    # 仅同步 nodes.json 记录的已启用出站；未启用节点会在下次启用时使用新策略。
+    ensure_config
+    local managed_tags use_resolver
+    managed_tags="$(_chain_managed_tags_json)"
+    use_resolver=0
+    _chain_domain_resolver_supported && use_resolver=1
 
-    # 已启用的 chain-* 出站同步更新；未启用节点会在下次启用时使用新策略。
-    if [[ -f "$CONFIG_FILE" ]]; then
-        if [[ "$ds" == "as_is" ]]; then
-            config_apply '(.outbounds // []) as $obs | .outbounds = ($obs | map(if ((.tag // "") | startswith("chain-")) then del(.domain_strategy) else . end))' \
-                || { _err "同步已启用出站失败"; _pause; return 1; }
+    if [[ "$ds" == "as_is" ]]; then
+        config_apply_checked --argjson managed_tags "$managed_tags" '
+            def managed_chain:
+                (.tag // "") as $tag | (($managed_tags | index($tag)) != null);
+
+            .outbounds = ((.outbounds // []) | map(
+                if managed_chain then del(.domain_strategy, .domain_resolver)
+                else .
+                end
+            ))
+        ' || {
+            _err "同步已启用出站失败 (未写入):"
+            _print_config_transition_error
+            _pause
+            return 1
+        }
+    else
+        if [[ "$use_resolver" == "1" ]]; then
+            config_apply_checked --arg resolver "$CHAIN_DOMAIN_RESOLVER_TAG" --arg ds "$ds" --argjson managed_tags "$managed_tags" '
+                def managed_chain:
+                    (.tag // "") as $tag | (($managed_tags | index($tag)) != null);
+
+                .dns //= {} |
+                .dns.servers //= [] |
+                (if ([.dns.servers[]? | select((.tag // "") == $resolver and (.type // "") != "local")] | length) > 0 then
+                    error("DNS 解析器 tag 冲突: " + $resolver)
+                 elif ([.dns.servers[]?.tag] | index($resolver)) then .
+                 else .dns.servers += [{type:"local", tag:$resolver}]
+                 end) |
+                .outbounds = ((.outbounds // []) | map(
+                    if managed_chain then
+                        .domain_resolver = {server:$resolver, strategy:$ds} |
+                        del(.domain_strategy)
+                    else .
+                    end
+                ))
+            ' || {
+                _err "同步已启用出站失败 (未写入):"
+                _print_config_transition_error
+                _pause
+                return 1
+            }
         else
-            config_apply --arg ds "$ds" '(.outbounds // []) as $obs | .outbounds = ($obs | map(if ((.tag // "") | startswith("chain-")) then .domain_strategy=$ds else . end))' \
-                || { _err "同步已启用出站失败"; _pause; return 1; }
+            config_apply_checked --arg ds "$ds" --argjson managed_tags "$managed_tags" '
+                def managed_chain:
+                    (.tag // "") as $tag | (($managed_tags | index($tag)) != null);
+
+                .outbounds = ((.outbounds // []) | map(
+                    if managed_chain then
+                        .domain_strategy = $ds |
+                        del(.domain_resolver)
+                    else .
+                    end
+                ))
+            ' || {
+                _err "同步已启用出站失败 (未写入):"
+                _print_config_transition_error
+                _pause
+                return 1
+            }
         fi
+    fi
+
+    if ! _write_chain_domain_strategy "$ds"; then
+        _err "解析策略文件写入失败, 配置已更新但策略文件未更新。"
+        _pause
+        return 1
     fi
     _ok "链式代理解析策略已设置为: $(_chain_domain_strategy_label)"
     _restart_if_running
@@ -1657,12 +1836,13 @@ parse_proxy_url() {
     return 0
 }
 
-# 确保 route 基础结构与 direct/block 出站存在。
-_ensure_route() {
-    config_apply '
+_set_final_outbound_checked() {
+    local tag="$1"
+    config_apply_checked --arg t "$tag" '
         .outbounds //= [] | .route //= {} | .route.rules //= [] | .route.rule_set //= [] |
         ( if ([.outbounds[]?.tag] | index("direct")) then . else .outbounds += [{"type":"direct","tag":"direct"}] end ) |
-        ( if ([.outbounds[]?.tag] | index("block"))  then . else .outbounds += [{"type":"block","tag":"block"}] end )
+        ( if ([.outbounds[]?.tag] | index("block"))  then . else .outbounds += [{"type":"block","tag":"block"}] end ) |
+        .route.final=$t
     '
 }
 
@@ -1785,17 +1965,38 @@ _activate_node() {
     ob="$(echo "$ob" | jq --arg t "$tag" '.tag=$t')"
     ob="$(_apply_chain_domain_strategy_to_outbound "$ob")"
 
-    _ensure_route
-    config_apply --argjson ob "$ob" '.outbounds += [$ob]' || { _err "写入出站失败"; return 1; }
-    nodes_apply --arg id "$id" --arg t "$tag" '(.nodes[]|select(.id==$id)|.active_tag)=$t'
-
-    local check_out
-    if check_out="$(config_check)"; then
-        _ok "已启用节点: ${name} (出站 tag: ${tag})"
-    else
-        _err "启用后配置校验失败 (已写入, 请检查):"
-        echo "$check_out" | sed 's/^/    /'
+    if ! config_apply_checked --argjson ob "$ob" --arg resolver "$CHAIN_DOMAIN_RESOLVER_TAG" '
+        .outbounds //= [] | .route //= {} | .route.rules //= [] | .route.rule_set //= [] |
+        ( if ([.outbounds[]?.tag] | index("direct")) then . else .outbounds += [{"type":"direct","tag":"direct"}] end ) |
+        ( if ([.outbounds[]?.tag] | index("block"))  then . else .outbounds += [{"type":"block","tag":"block"}] end ) |
+        if ((($ob.domain_resolver // {}) | .server // "") == $resolver) then
+            .dns //= {} |
+            .dns.servers //= [] |
+            if ([.dns.servers[]? | select((.tag // "") == $resolver and (.type // "") != "local")] | length) > 0 then
+                error("DNS 解析器 tag 冲突: " + $resolver)
+            elif ([.dns.servers[]?.tag] | index($resolver)) then .
+            else .dns.servers += [{type:"local", tag:$resolver}]
+            end
+        else .
+        end |
+        .outbounds += [$ob]
+    '; then
+        _err "启用后配置校验失败 (未写入):"
+        _print_config_transition_error
+        return 1
     fi
+
+    if ! nodes_apply --arg id "$id" --arg t "$tag" '(.nodes[]|select(.id==$id)|.active_tag)=$t'; then
+        _err "记录节点启用状态失败, 正在回滚出站。"
+        config_apply_checked --arg t "$tag" '
+            .outbounds = ((.outbounds // []) | map(select(.tag != $t))) |
+            .route.rules = ((.route.rules // []) | map(select(.outbound != $t))) |
+            ( if (.route.final // "") == $t then (.route.final = "direct") else . end )
+        ' >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    _ok "已启用节点: ${name} (出站 tag: ${tag})"
     return 0
 }
 
@@ -1808,14 +2009,15 @@ _deactivate_node() {
         nodes_apply --arg id "$id" '(.nodes[]|select(.id==$id)|.active_tag)=""'
         return 0
     fi
-    if config_apply --arg t "$tag" '
+    if config_apply_checked --arg t "$tag" '
         .outbounds = (.outbounds | map(select(.tag != $t))) |
         .route.rules = ((.route.rules // []) | map(select(.outbound != $t))) |
         ( if (.route.final // "") == $t then (.route.final = "direct") else . end )
     '; then
         _ok "已停用节点 (移除出站 $tag)"
     else
-        _err "停用节点失败"
+        _err "停用节点失败 (未写入):"
+        _print_config_transition_error
         return 1
     fi
     nodes_apply --arg id "$id" '(.nodes[]|select(.id==$id)|.active_tag)=""'
@@ -1869,7 +2071,12 @@ node_import() {
             if _node_active_tag_live "$tag"; then
                 read -rp "  是否将全部流量默认走此节点 (设为 final)? [y/N]: " setf
                 if [[ "$setf" =~ ^[Yy]$ ]]; then
-                    config_apply --arg t "$tag" '.route.final=$t' && _ok "已设为默认出站: $tag"
+                    if _set_final_outbound_checked "$tag"; then
+                        _ok "已设为默认出站: $tag"
+                    else
+                        _err "设置默认出站失败 (未写入):"
+                        _print_config_transition_error
+                    fi
                 fi
                 _restart_if_running
             fi
@@ -1990,8 +2197,12 @@ manage_chain_node_state() {
                 _deactivate_node "$id"
                 ;;
             2)
-                _ensure_route
-                config_apply --arg t "$tag" '.route.final=$t' && _ok "已设为默认出站: $tag"
+                if _set_final_outbound_checked "$tag"; then
+                    _ok "已设为默认出站: $tag"
+                else
+                    _err "设置默认出站失败 (未写入):"
+                    _print_config_transition_error
+                fi
                 _restart_if_running
                 ;;
             *) _warn "已取消" ;;
@@ -2011,7 +2222,12 @@ manage_chain_node_state() {
     if _node_active_tag_live "$tag"; then
         read -rp "  是否将全部流量默认走此节点 (设为 final)? [y/N]: " setf
         if [[ "$setf" =~ ^[Yy]$ ]]; then
-            config_apply --arg t "$tag" '.route.final=$t' && _ok "已设为默认出站: $tag"
+            if _set_final_outbound_checked "$tag"; then
+                _ok "已设为默认出站: $tag"
+            else
+                _err "设置默认出站失败 (未写入):"
+                _print_config_transition_error
+            fi
         fi
         _restart_if_running
     fi
@@ -2061,11 +2277,16 @@ delete_chain_node() {
     [[ "$ok" =~ ^[Yy]$ ]] || { _warn "已取消"; _pause; return 1; }
 
     if _node_active_tag_live "$tag"; then
-        config_apply --arg t "$tag" '
+        config_apply_checked --arg t "$tag" '
             .outbounds = ((.outbounds // []) | map(select(.tag != $t))) |
             .route.rules = ((.route.rules // []) | map(select(.outbound != $t))) |
             ( if (.route.final // "") == $t then (.route.final = "direct") else . end )
-        ' || { _err "清理出站失败"; _pause; return 1; }
+        ' || {
+            _err "清理出站失败 (未写入):"
+            _print_config_transition_error
+            _pause
+            return 1
+        }
     fi
 
     nodes_apply --arg id "$id" '.nodes = ((.nodes // []) | map(select(.id != $id)))' \
@@ -2139,7 +2360,6 @@ _pick_target_outbound() {
 # 参数: tag url_or_path type(remote/local) format target
 _add_ruleset_rule() {
     local rtag="$1" src="$2" kind="$3" fmt="$4" target="$5"
-    _ensure_route
     local rsentry
     if [[ "$kind" == "remote" ]]; then
         rsentry="$(jq -n --arg tag "$rtag" --arg fmt "$fmt" --arg url "$src" \
@@ -2149,7 +2369,10 @@ _add_ruleset_rule() {
             '{ type:"local", tag:$tag, format:$fmt, path:$path }')"
     fi
     # 去重后追加 rule_set, 并追加规则
-    config_apply --argjson rs "$rsentry" --arg tag "$rtag" --arg out "$target" '
+    config_apply_checked --argjson rs "$rsentry" --arg tag "$rtag" --arg out "$target" '
+        .outbounds //= [] | .route //= {} | .route.rules //= [] | .route.rule_set //= [] |
+        ( if ([.outbounds[]?.tag] | index("direct")) then . else .outbounds += [{"type":"direct","tag":"direct"}] end ) |
+        ( if ([.outbounds[]?.tag] | index("block"))  then . else .outbounds += [{"type":"block","tag":"block"}] end ) |
         .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $tag)) + [$rs]) |
         .route.rules   = ((.route.rules // []) + [{ rule_set:[$tag], outbound:$out }])
     '
@@ -2158,7 +2381,6 @@ _add_ruleset_rule() {
 # 特色: 添加用户指定的 SRS 规则集 (远程 / 本地)
 add_custom_srs() {
     _header "添加自定义规则集 (SRS)"
-    _ensure_route
 
     menu_select "规则集来源" \
         "远程 URL (自动下载)" \
@@ -2232,17 +2454,14 @@ add_custom_srs() {
     echo ""
     _pick_target_outbound "命中该规则集的流量走哪个出站?" || { _warn "已取消"; _pause; return 1; }
 
-    _add_ruleset_rule "$rtag" "$src" "$kind" "$fmt" "$ROUTE_TARGET" || { _err "写入规则失败"; _pause; return 1; }
-
-    # 校验
-    echo ""
-    local check_out
-    if check_out="$(config_check)"; then
+    if _add_ruleset_rule "$rtag" "$src" "$kind" "$fmt" "$ROUTE_TARGET"; then
         _ok "规则已添加并校验通过: [$rtag] -> $ROUTE_TARGET"
         _restart_if_running
     else
-        _err "配置校验失败 (已写入, 请检查):"
-        echo "$check_out" | sed 's/^/    /'
+        _err "写入规则失败 (未写入):"
+        _print_config_transition_error
+        _pause
+        return 1
     fi
     _pause
     return 0
@@ -2251,7 +2470,6 @@ add_custom_srs() {
 # 预设: 国内直连, 其余走代理
 preset_cn_direct() {
     _header "预设: 国内直连 / 其余走代理"
-    _ensure_route
 
     if [[ -z "$(_list_chain_outbound_tags)" ]]; then
         _err "尚无可用的 SS / SS2022 链式代理出站, 请先「添加链式代理」。"
@@ -2265,20 +2483,22 @@ preset_cn_direct() {
     rs_geoip="$(jq -n --arg u "${GEOIP_BASE}/geoip-cn.srs" '{type:"remote",tag:"geoip-cn",format:"binary",url:$u,download_detour:"direct"}')"
     rs_geosite="$(jq -n --arg u "${GEOSITE_BASE}/geosite-cn.srs" '{type:"remote",tag:"geosite-cn",format:"binary",url:$u,download_detour:"direct"}')"
 
-    config_apply --argjson a "$rs_geoip" --argjson b "$rs_geosite" --arg proxy "$proxy" '
+    if config_apply_checked --argjson a "$rs_geoip" --argjson b "$rs_geosite" --arg proxy "$proxy" '
+        .outbounds //= [] | .route //= {} | .route.rules //= [] | .route.rule_set //= [] |
+        ( if ([.outbounds[]?.tag] | index("direct")) then . else .outbounds += [{"type":"direct","tag":"direct"}] end ) |
+        ( if ([.outbounds[]?.tag] | index("block"))  then . else .outbounds += [{"type":"block","tag":"block"}] end ) |
         .route.rule_set = ((.route.rule_set // []) | map(select(.tag!="geoip-cn" and .tag!="geosite-cn")) + [$a,$b]) |
         .route.rules   = ((.route.rules // []) | map(select((.rule_set // []) | (index("geoip-cn")|not) and (index("geosite-cn")|not)))
                            + [{ rule_set:["geoip-cn","geosite-cn"], outbound:"direct" }]) |
         .route.final = $proxy
-    ' || { _err "写入失败"; _pause; return 1; }
-
-    local check_out
-    if check_out="$(config_check)"; then
+    '; then
         _ok "已配置: 国内(geoip-cn/geosite-cn)直连, 其余走 ${proxy}"
         _restart_if_running
     else
-        _err "配置校验失败 (已写入, 请检查):"
-        echo "$check_out" | sed 's/^/    /'
+        _err "配置校验失败 (未写入):"
+        _print_config_transition_error
+        _pause
+        return 1
     fi
     _pause
 }
@@ -2286,20 +2506,23 @@ preset_cn_direct() {
 # 预设: 广告拦截
 preset_block_ads() {
     _header "预设: 广告拦截"
-    _ensure_route
     local rs
     rs="$(jq -n --arg u "${GEOSITE_BASE}/geosite-category-ads-all.srs" '{type:"remote",tag:"geosite-ads",format:"binary",url:$u,download_detour:"direct"}')"
-    config_apply --argjson rs "$rs" '
+    if config_apply_checked --argjson rs "$rs" '
+        .outbounds //= [] | .route //= {} | .route.rules //= [] | .route.rule_set //= [] |
+        ( if ([.outbounds[]?.tag] | index("direct")) then . else .outbounds += [{"type":"direct","tag":"direct"}] end ) |
+        ( if ([.outbounds[]?.tag] | index("block"))  then . else .outbounds += [{"type":"block","tag":"block"}] end ) |
         .route.rule_set = ((.route.rule_set // []) | map(select(.tag!="geosite-ads")) + [$rs]) |
         .route.rules   = ((.route.rules // []) | map(select((.rule_set // []) | (index("geosite-ads")|not)))
                            + [{ rule_set:["geosite-ads"], outbound:"block" }])
-    ' || { _err "写入失败"; _pause; return 1; }
-    local check_out
-    if check_out="$(config_check)"; then
+    '; then
         _ok "已启用广告拦截 (geosite-category-ads-all -> block)"
         _restart_if_running
     else
-        _err "配置校验失败:"; echo "$check_out" | sed 's/^/    /'
+        _err "配置校验失败 (未写入):"
+        _print_config_transition_error
+        _pause
+        return 1
     fi
     _pause
 }
@@ -2307,9 +2530,13 @@ preset_block_ads() {
 # 设置默认出站 final
 set_final_outbound() {
     _header "设置默认出站 (final)"
-    _ensure_route
     _pick_target_outbound "未命中任何规则的流量走哪个出站?" || { _warn "已取消"; _pause; return; }
-    config_apply --arg t "$ROUTE_TARGET" '.route.final=$t' && _ok "默认出站已设为: $ROUTE_TARGET"
+    if _set_final_outbound_checked "$ROUTE_TARGET"; then
+        _ok "默认出站已设为: $ROUTE_TARGET"
+    else
+        _err "设置默认出站失败 (未写入):"
+        _print_config_transition_error
+    fi
     _restart_if_running
     _pause
 }
@@ -2321,7 +2548,8 @@ list_outbounds_routes() {
 
     echo -e "  ${W}${BOLD}出站 (outbounds)${NC}"
     _line
-    jq -r '.outbounds[]? | "\(.tag)|\(.type)|\(.server // "-")|\(.server_port // "-")|\(.domain_strategy // "-")"' "$CONFIG_FILE" 2>/dev/null \
+    jq -r '.outbounds[]? |
+        "\(.tag)|\(.type)|\(.server // "-")|\(.server_port // "-")|\(((if ((.domain_resolver // null) | type) == "object" then .domain_resolver.strategy else null end) // .domain_strategy // "-"))"' "$CONFIG_FILE" 2>/dev/null \
     | while IFS='|' read -r tag type srv sport ds; do
         local extra=""; [[ "$srv" != "-" ]] && extra="${srv}:${sport}"
         local parse=""; [[ "$ds" != "-" ]] && parse="解析:${ds}"
@@ -2368,7 +2596,6 @@ list_outbounds_routes() {
 remove_outbound_route() {
     while true; do
         _header "删除出站 / 规则"
-        _ensure_route
         menu_select "选择要删除的内容" \
             "删除链式代理出站" \
             "删除一条分流规则" \
@@ -2394,14 +2621,15 @@ _remove_outbound() {
     local tag="${tags[$((c-1))]}"
     read -rp "  确认删除出站 '$tag'? 相关分流规则/final 也会一并清理 [y/N]: " ok
     [[ "$ok" =~ ^[Yy]$ ]] || { _warn "已取消"; _pause; return; }
-    if config_apply --arg t "$tag" '
+    if config_apply_checked --arg t "$tag" '
         .outbounds = (.outbounds | map(select(.tag != $t))) |
         .route.rules = ((.route.rules // []) | map(select(.outbound != $t))) |
         ( if (.route.final // "") == $t then (.route.final = "direct") else . end )
     '; then
         _ok "已删除出站 $tag"
     else
-        _err "删除出站失败"
+        _err "删除出站失败 (未写入):"
+        _print_config_transition_error
         _pause
         return
     fi
@@ -2421,7 +2649,14 @@ _remove_rule() {
     menu_select "选择要删除的规则" "${opts[@]}"
     local c="$MENU_CHOICE"
     (( c < 1 || c > rn )) && { _warn "已取消"; _pause; return; }
-    config_apply --argjson i "$((c-1))" 'del(.route.rules[$i])' && _ok "已删除规则 #$c"
+    if config_apply_checked --argjson i "$((c-1))" 'del(.route.rules[$i])'; then
+        _ok "已删除规则 #$c"
+    else
+        _err "删除规则失败 (未写入):"
+        _print_config_transition_error
+        _pause
+        return
+    fi
     _restart_if_running
     _pause
 }
@@ -2435,10 +2670,17 @@ _remove_ruleset() {
     local c="$MENU_CHOICE"
     (( c < 1 || c > ${#tags[@]} )) && { _warn "已取消"; _pause; return; }
     local tag="${tags[$((c-1))]}"
-    config_apply --arg t "$tag" '
+    if config_apply_checked --arg t "$tag" '
         .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $t))) |
         .route.rules = ((.route.rules // []) | map(select((.rule_set // []) | (index($t)|not))))
-    ' && _ok "已删除规则集 $tag (及引用它的规则)"
+    '; then
+        _ok "已删除规则集 $tag (及引用它的规则)"
+    else
+        _err "删除规则集失败 (未写入):"
+        _print_config_transition_error
+        _pause
+        return
+    fi
     _restart_if_running
     _pause
 }
@@ -2489,6 +2731,86 @@ outbound_menu() {
             *) return ;;
         esac
     done
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+#  脚本更新
+#───────────────────────────────────────────────────────────────────────────────
+update_script() {
+    _header "更新脚本"
+
+    if [[ ! -f "$SCRIPT_SRC" ]]; then
+        _err "无法定位当前脚本路径 (${SCRIPT_SRC})。"
+        _pause
+        return 1
+    fi
+
+    local branch="main" meta tmp url remote_version backup
+    _info "检查 GitHub 最新脚本..."
+    if meta="$(curl -fsSL --connect-timeout 10 --max-time 15 "$GITHUB_API_REPO" 2>/dev/null)"; then
+        branch="$(echo "$meta" | jq -r '.default_branch // empty' 2>/dev/null)"
+        branch="${branch:-main}"
+    fi
+
+    tmp="$(mktemp)" || { _err "创建临时文件失败"; _pause; return 1; }
+    url="${GITHUB_RAW_BASE}/${branch}/singbox-manager.sh"
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        _err "下载最新脚本失败: ${url}"
+        _pause
+        return 1
+    fi
+
+    if ! grep -q '^readonly APP_NAME="singbox-click"$' "$tmp" || ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        _err "下载内容不像有效脚本, 已中止。"
+        _pause
+        return 1
+    fi
+
+    if cmp -s "$SCRIPT_SRC" "$tmp"; then
+        rm -f "$tmp"
+        _ok "当前已是最新脚本。"
+        _pause
+        return 0
+    fi
+
+    remote_version="$(sed -nE 's/^readonly SCRIPT_VERSION="([^"]+)".*/\1/p' "$tmp" | head -1)"
+    remote_version="${remote_version:-未知}"
+    echo -e "  当前版本: ${W}${SCRIPT_VERSION}${NC}"
+    echo -e "  最新版本: ${W}${remote_version}${NC}"
+    echo -e "  来源分支: ${W}${branch}${NC}"
+    echo ""
+    read -rp "  是否更新当前脚本? [y/N]: " ok
+    if [[ ! "$ok" =~ ^[Yy]$ ]]; then
+        rm -f "$tmp"
+        _warn "已取消"
+        _pause
+        return 1
+    fi
+
+    backup="${SCRIPT_SRC}.bak.$(date +%Y%m%d%H%M%S)"
+    if ! cp -p "$SCRIPT_SRC" "$backup"; then
+        rm -f "$tmp"
+        _err "创建备份失败, 已中止。"
+        _pause
+        return 1
+    fi
+
+    if ! cp -f "$tmp" "$SCRIPT_SRC"; then
+        rm -f "$tmp"
+        _err "替换脚本失败, 备份保留在: ${backup}"
+        _pause
+        return 1
+    fi
+    chmod 755 "$SCRIPT_SRC" 2>/dev/null || true
+    rm -f "$tmp"
+
+    _ok "脚本已更新。"
+    _dim "备份: ${backup}"
+    _dim "请重新运行脚本以加载新版本。"
+    _pause
+    exit 0
 }
 
 #───────────────────────────────────────────────────────────────────────────────
@@ -2638,17 +2960,19 @@ main_menu() {
         echo ""
 
         local opts=() actions=()
-        opts+=("内核管理 (安装 / 更新 / 删除)")
+        opts+=("内核管理")
         actions+=("core")
         if core_installed; then
-            opts+=("协议管理 (AnyTLS / SS / 清单 / 删除)")
+            opts+=("协议管理")
             actions+=("protocol")
         fi
-        opts+=("出站 / 分流管理 (链式代理)")
+        opts+=("出站 / 分流")
         actions+=("outbound")
-        opts+=("服务管理 (启停 / 状态 / 日志)")
+        opts+=("服务管理")
         actions+=("service")
-        opts+=("快捷命令 / 卸载脚本")
+        opts+=("更新脚本")
+        actions+=("update")
+        opts+=("快捷命令")
         actions+=("shortcut")
         opts+=("退出")
         actions+=("exit")
@@ -2663,6 +2987,7 @@ main_menu() {
             protocol) protocol_menu ;;
             outbound) outbound_menu ;;
             service) service_menu ;;
+            update) update_script ;;
             shortcut) shortcut_menu ;;
             *)
                 echo ""

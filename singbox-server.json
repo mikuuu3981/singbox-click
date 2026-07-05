@@ -3,6 +3,14 @@
     "level": "warn",
     "timestamp": true
   },
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "singbox-click-local"
+      }
+    ]
+  },
   "inbounds": [
     {
       "type": "anytls",
@@ -43,7 +51,10 @@
       "server_port": 20632,
       "method": "aes-256-gcm",
       "password": "占位",
-      "domain_strategy": "prefer_ipv4"
+      "domain_resolver": {
+        "server": "singbox-click-local",
+        "strategy": "prefer_ipv4"
+      }
     }
   ],
   "route": {
